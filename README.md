@@ -7,19 +7,23 @@ Built with SvelteKit (static, client-only), Svelte 5 runes, TypeScript and Tailw
 ## Develop
 
 ```sh
-nix develop        # or: direnv allow
-pnpm install
-pnpm dev           # http://localhost:5173
+./run.sh           # dev server on http://localhost:5173
 ```
 
-The dev shell provides Node 22, pnpm and `v4l-utils`. Run `v4l2-ctl --list-formats-ext -d /dev/video0` to see the modes your card really supports.
+`run.sh` enters the Nix shell from `shell.nix` and installs dependencies on first run or when the lockfile changes. Then it runs the command you asked for:
 
-| Command       | What it does              |
-| ------------- | ------------------------- |
-| `pnpm check`  | Type-check (svelte-check) |
-| `pnpm test`   | Unit tests (vitest)       |
-| `pnpm build`  | Static site in `build/`   |
-| `pnpm format` | Prettier                  |
+| Command            | What it does                                                 |
+| ------------------ | ------------------------------------------------------------ |
+| `./run.sh dev`     | Dev server (default); extra args pass through, e.g. `--host` |
+| `./run.sh build`   | Static site in `build/`                                      |
+| `./run.sh preview` | Build, then serve `build/` on port 4173                      |
+| `./run.sh check`   | Type-check (svelte-check)                                    |
+| `./run.sh test`    | Unit tests (vitest)                                          |
+| `./run.sh lint`    | Check formatting                                             |
+| `./run.sh format`  | Format all files                                             |
+| `./run.sh docker`  | `docker compose up --build` (port 8080)                      |
+
+For an interactive shell, use `nix-shell`, `nix develop`, or `direnv allow`. They all give the same environment: `shell.nix` pins nixpkgs to the revision in `flake.lock`, and the flake reuses `shell.nix`. That environment contains Node 22, pnpm and `v4l-utils`. Run `v4l2-ctl --list-formats-ext -d /dev/video0` to see the modes your card really supports.
 
 Camera access needs a secure context, so serve the build over `https://` or `localhost`.
 

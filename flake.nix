@@ -14,19 +14,9 @@
     in
     {
       devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell {
-          packages = with pkgs; [
-            nodejs_22
-            pnpm
-            v4l-utils
-          ];
-          shellHook = ''
-            echo "lainify dev shell — node $(node -v), pnpm $(pnpm -v)"
-            echo "  pnpm install && pnpm dev"
-          '';
-        };
+        default = import ./shell.nix { inherit pkgs; };
       });
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
     };
 }
