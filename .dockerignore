@@ -1,0 +1,11 @@
+.git
+.github
+.direnv
+.svelte-kit
+.vscode
+build
+node_modules
+result
+Dockerfile
+compose.yaml
+*.md
