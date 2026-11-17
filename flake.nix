@@ -1,5 +1,5 @@
 {
-  description = "lainify — capture card viewer (SvelteKit)";
+  description = "lainify — capture card viewer (Rust + Qt/QML + GStreamer)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -15,6 +15,10 @@
     {
       devShells = forAllSystems (pkgs: {
         default = import ./shell.nix { inherit pkgs; };
+      });
+
+      packages = forAllSystems (pkgs: {
+        default = pkgs.callPackage ./package.nix { };
       });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);

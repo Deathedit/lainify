@@ -7,20 +7,18 @@ usage() {
 	cat <<'USAGE'
 Usage: ./run.sh [command] [args...]
 
-  dev       start the dev server on http://localhost:5173 (default)
-  build     production build into build/
-  preview   build, then serve build/ on http://localhost:4173
-  check     type-check
-  test      unit tests
-  lint      check formatting
-  format    format all files
-  docker    build and start the Docker image (http://localhost:8080)
+  run       build (release) and start lainify (default)
+  debug     build (debug) and start lainify, with Qt logging on stderr
+  build     release build into target/release/lainify
+  check     clippy
+  fmt       format the Rust code
+  package   nix build (standalone binary in ./result)
 
-Extra args are passed through, e.g. ./run.sh dev --host
+Extra args are passed through to the command.
 USAGE
 }
 
-cmd="${1:-dev}"
+cmd="${1:-run}"
 [[ $# -gt 0 ]] && shift
 
 case "$cmd" in
@@ -28,11 +26,11 @@ case "$cmd" in
 		usage
 		exit 0
 		;;
-	docker)
-		# Runs on the host's Docker, no Nix shell needed.
-		exec docker compose up --build "$@"
+	package)
+		# Builds through the flake; no dev shell needed.
+		exec nix build "$@"
 		;;
-	dev | build | preview | check | test | lint | format) ;;
+	run | debug | build | check | fmt) ;;
 	*)
 		echo "run.sh: unknown command '$cmd'" >&2
 		usage >&2
@@ -45,17 +43,10 @@ if [[ -z "${IN_NIX_SHELL:-}" ]]; then
 	exec nix-shell --run "$(printf '%q ' ./run.sh "$cmd" "$@")"
 fi
 
-# Install dependencies on first run or when the lockfile changed since the last install.
-if [[ ! -f node_modules/.modules.yaml || pnpm-lock.yaml -nt node_modules/.modules.yaml ]]; then
-	pnpm install --frozen-lockfile
-	# pnpm leaves the marker untouched when nothing changed; bump it so we don't reinstall every run.
-	touch node_modules/.modules.yaml
-fi
-
 case "$cmd" in
-	preview)
-		pnpm build
-		exec pnpm preview "$@"
-		;;
-	*) exec pnpm "$cmd" "$@" ;;
+	run) exec cargo run --release -- "$@" ;;
+	debug) QT_FORCE_STDERR_LOGGING=1 exec cargo run -- "$@" ;;
+	build) exec cargo build --release "$@" ;;
+	check) exec cargo clippy --release "$@" ;;
+	fmt) exec cargo fmt "$@" ;;
 esac

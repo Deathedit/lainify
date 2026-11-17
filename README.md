@@ -1,92 +1,61 @@
 # lainify
 
-A clean, low-latency browser viewer for capture cards and webcams. It shows the picture, plays the sound, takes screenshots and records.
+A clean, low-latency desktop viewer for capture cards. It opens the card in its real formats, including uncompressed RGB 4:4:4, and takes lossless screenshots.
 
-Built with SvelteKit (static, client-only), Svelte 5 runes, TypeScript and Tailwind CSS v4.
+Built with Rust, Qt 6 / QML (through [cxx-qt](https://github.com/KDAB/cxx-qt)) and GStreamer. Linux only.
 
-## Develop
+## Why native
 
-```sh
-./run.sh           # dev server on http://localhost:5173
-```
+lainify started as a browser app, and browsers set a hard limit on picture quality. Chromium opens any capture card as MJPEG once the mode is larger than 640×480, processes video as 4:2:0 internally, and gives a web page no way to change either. A native app can open the card in whatever format it offers.
 
-`run.sh` enters the Nix shell from `shell.nix` and installs dependencies on first run or when the lockfile changes. Then it runs the command you asked for:
+With an Elgato 4K X, that means:
 
-| Command            | What it does                                                 |
-| ------------------ | ------------------------------------------------------------ |
-| `./run.sh dev`     | Dev server (default); extra args pass through, e.g. `--host` |
-| `./run.sh build`   | Static site in `build/`                                      |
-| `./run.sh preview` | Build, then serve `build/` on port 4173                      |
-| `./run.sh check`   | Type-check (svelte-check)                                    |
-| `./run.sh test`    | Unit tests (vitest)                                          |
-| `./run.sh lint`    | Check formatting                                             |
-| `./run.sh format`  | Format all files                                             |
-| `./run.sh docker`  | `docker compose up --build` (port 8080)                      |
+| Mode         | Formats the card offers                       |
+| ------------ | --------------------------------------------- |
+| 1080p60      | RGB 4:4:4, YUV 4:2:2, 10-bit P010, NV12, MJPEG |
+| 4K30         | NV12 / I420 (uncompressed 4:2:0), MJPEG       |
+| 4K60 and up  | MJPEG only                                    |
 
-For an interactive shell, use `nix-shell`, `nix develop`, or `direnv allow`. They all give the same environment: `shell.nix` pins nixpkgs to the revision in `flake.lock`, and the flake reuses `shell.nix`. That environment contains Node 22, pnpm and `v4l-utils`. Run `v4l2-ctl --list-formats-ext -d /dev/video0` to see the modes your card really supports.
-
-Camera access needs a secure context, so serve the build over `https://` or `localhost`.
-
-## Docker
+## Run
 
 ```sh
-docker compose up -d --build     # http://localhost:8080
+./run.sh            # build (release) and start
 ```
 
-The image is a two-stage build: pnpm builds the static site, and unprivileged nginx serves it on port 8080. That nginx has SPA fallback, long-lived caching for hashed assets, and a `Permissions-Policy` that allows the camera and microphone for this origin only. Compose binds it to `127.0.0.1` because browsers only allow camera access on `localhost` or HTTPS. To reach it from other machines, put it behind an HTTPS reverse proxy.
+`run.sh` enters the Nix shell from `shell.nix` (Rust, Qt 6 with Qt Multimedia, GStreamer, `v4l-utils`) and runs the command you asked for:
 
-To run the CI-built image instead of building locally:
+| Command            | What it does                                        |
+| ------------------ | --------------------------------------------------- |
+| `./run.sh run`     | Release build, then start (default)                 |
+| `./run.sh debug`   | Debug build, then start with Qt logging on stderr   |
+| `./run.sh build`   | Release build into `target/release/lainify`         |
+| `./run.sh check`   | Clippy                                              |
+| `./run.sh fmt`     | Format the Rust code                                |
+| `./run.sh package` | `nix build`, a standalone binary in `./result`      |
 
-```sh
-LAINIFY_IMAGE=ghcr.io/<owner>/lainify:latest docker compose pull
-LAINIFY_IMAGE=ghcr.io/<owner>/lainify:latest docker compose up -d
-```
+For an interactive shell, use `nix-shell`, `nix develop` or `direnv allow`; they're the same environment. Without the repo, `nix run github:Deathedit/lainify` works too.
 
-### CI
+Run `v4l2-ctl --list-formats-ext -d /dev/video0` to see the modes your card really supports.
 
-`.github/workflows/docker.yml` first runs `pnpm check` and `pnpm test`. It then builds a `linux/amd64` + `linux/arm64` image and pushes it to `ghcr.io/<owner>/<repo>`:
+## Using it
 
-| Trigger        | Tags                            |
-| -------------- | ------------------------------- |
-| push to `main` | `latest`, `main`, `sha-<short>` |
-| tag `v1.2.3`   | `1.2.3`, `1.2`, `sha-<short>`   |
-| pull request   | built only, not pushed          |
+- On launch it opens the first capture device in the best format it offers, preferring RGB 4:4:4 at 1080p60.
+- Device, Format, Resolution and Frame rate are listed from the card's real format list, so every combination shown is one the card offers.
+- The bar at the bottom shows the mode the card is actually delivering and the frame rate reaching the screen.
+- Screenshots are lossless PNGs in `~/Pictures/lainify`.
+- Shortcuts: <kbd>F</kbd> fullscreen, <kbd>Esc</kbd> leave fullscreen, <kbd>S</kbd> screenshot, <kbd>Space</kbd> start/stop.
 
-New GHCR packages start private. To make it public, go to the repo → Packages → lainify → Package settings → Change visibility.
+Not there yet: audio, recording, remembering your choices, hot-plug detection (press Refresh).
 
-## Features
-
-- Picks the capture device automatically and matches its audio input (by USB id, group or name). It never falls back to a microphone.
-- Audio is raw: echo cancellation, noise suppression and AGC are off. It requests stereo at 48 kHz and plays through Web Audio with 0–150 % volume and a stereo peak meter.
-- Separate resolution and frame-rate pickers, each limited to the device's reported range. It requests native modes without browser scaling.
-- Measured presentation fps is shown in the status pill.
-- PNG screenshots at native resolution.
-- Recording to MP4 (H.264/AAC) or WebM. In Chromium you can stream long recordings straight to a file.
-- Fullscreen; controls and cursor auto-hide.
-- Settings are remembered between visits.
-
-### Shortcuts
-
-`F` fullscreen · `M` mute · `↑`/`↓` volume · `S` screenshot · `R` record · `,` settings · `Esc` close
-
-## Troubleshooting
-
-- **"Device is busy"**: only one app can stream from a V4L2 device at a time. Close OBS or other tabs that use it.
-- **No sound from the card (Linux)**: PipeWire may have the card's profile set to _Off_. Enable it in pavucontrol → Configuration, or run:
-
-  ```sh
-  pactl set-card-profile alsa_card.usb-Elgato_… input:analog-stereo
-  ```
-
-## Layout
+## How it works
 
 ```
-src/lib/
-  capture/   device discovery, stream session, constraints, mode presets, errors
-  audio/     Web Audio engine + meter math
-  record/    MediaRecorder wrapper, MIME selection, screenshots
-  settings/  persisted preferences (schema + rune store)
-  ui/        idle tracker, fps meter, toasts, keyboard shortcuts
-  components/
-src/routes/+page.svelte   wires everything together
+device ! capsfilter [! jpegdec | ! videoflip] ! videoconvert ! appsink  →  QVideoFrame  →  VideoOutput
 ```
+
+- `src/devices.rs` lists devices and their exact modes through GStreamer's device monitor.
+- `src/pipeline.rs` builds the pipeline for the chosen mode. `videoconvert` passes through every format Qt can draw and only converts the rest (24-bit BGR → BGRx, losslessly), so colour detail is never reduced. UVC cards send RGB bottom-up, so RGB frames go through `videoflip`.
+- `cpp/frame_sink.*` copies each frame once into a `QVideoFrame` for the QML `VideoOutput`, keeping only the newest so a busy UI drops frames instead of lagging. It's the only hand-written C++, because cxx-qt-lib has no Qt Multimedia bindings.
+- `src/bridge/capture.rs` is the `Capture` object QML talks to; `qml/Main.qml` is the window.
+
+Qt sends its log to the systemd journal when stderr isn't a terminal; set `QT_FORCE_STDERR_LOGGING=1` (as `./run.sh debug` does) to see it.
