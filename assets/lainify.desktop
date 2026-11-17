@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=lainify
+GenericName=Capture Card Viewer
+Comment=Low-latency capture card viewer with uncompressed RGB 4:4:4, recording and replay clips
+Exec=lainify
+Icon=lainify
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=capture;elgato;hdmi;game;record;clip;
+StartupWMClass=lainify

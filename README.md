@@ -37,7 +37,7 @@ On a 5 Gbps port the card offers far fewer uncompressed modes; check `lsusb -t` 
 | `./run.sh fmt`     | Format the Rust code                                |
 | `./run.sh package` | `nix build`, a standalone binary in `./result`      |
 
-For an interactive shell, use `nix-shell`, `nix develop` or `direnv allow`; they're the same environment. Without the repo, `nix run github:Deathedit/lainify` works too.
+For an interactive shell, use `nix-shell`, `nix develop` or `direnv allow`; they're the same environment. Without the repo, `nix run github:Deathedit/lainify` works too. The package also installs a desktop entry and icon, so `nix profile install` puts lainify in your app launcher.
 
 Run `v4l2-ctl --list-formats-ext -d /dev/video0` to see the modes your card really supports.
 

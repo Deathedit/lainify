@@ -30,6 +30,16 @@ fn main() {
         if std::env::var_os("QT_QUICK_CONTROLS_STYLE").is_none() {
             std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Basic");
         }
+        // Two harmless warnings, unless you set your own rules:
+        // - services: the portal can't find lainify.desktop when running from the source tree
+        //   (the package installs it);
+        // - textinput: a Qt Wayland quirk on focus changes; lainify has no text fields.
+        if std::env::var_os("QT_LOGGING_RULES").is_none() {
+            std::env::set_var(
+                "QT_LOGGING_RULES",
+                "qt.qpa.services.warning=false;qt.qpa.wayland.textinput.warning=false",
+            );
+        }
     }
 
     let mut app = QGuiApplication::new();

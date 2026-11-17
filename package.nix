@@ -59,6 +59,12 @@ rustPlatform.buildRustPackage {
     export QMAKE="${qtEnv}/bin/qmake"
   '';
 
+  # The desktop entry is what the desktop portal and launchers look the app ID up in.
+  postInstall = ''
+    install -Dm644 assets/lainify.desktop $out/share/applications/lainify.desktop
+    install -Dm644 assets/lainify.svg $out/share/icons/hicolor/scalable/apps/lainify.svg
+  '';
+
   # Linking follows $QMAKE, so RUNPATH would point at qtEnv and drag its closure in.
   preFixup = ''
     patchelf --set-rpath \
