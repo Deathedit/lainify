@@ -1,14 +1,17 @@
 //! lainify (native) — a capture-card viewer that reads the card's real formats, including
 //! uncompressed RGB 4:4:4, which browsers can't.
 
+mod audio;
 mod bridge;
 mod devices;
-mod pipeline;
+mod paths;
+mod recorder;
+mod video;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
+use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 
 unsafe extern "C" {
     /// Registers the `com.lainify.native` FrameSink singleton. Defined in `cpp/frame_sink.cpp`.
@@ -24,11 +27,18 @@ fn main() {
     // SAFETY: single-threaded here; nothing has spawned and Qt is not initialised yet.
     unsafe {
         if std::env::var_os("QT_QUICK_CONTROLS_STYLE").is_none() {
-            std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Fusion");
+            std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Basic");
         }
     }
 
     let mut app = QGuiApplication::new();
+    if let Some(mut app) = app.as_mut() {
+        // Where QML's Settings keeps preferences: ~/.config/lainify/lainify.conf.
+        app.as_mut()
+            .set_organization_name(&QString::from("lainify"));
+        app.as_mut().set_application_name(&QString::from("lainify"));
+    }
+    QGuiApplication::set_desktop_file_name(&QString::from("lainify"));
     // SAFETY: plain registration call; the application exists and no QML has loaded yet.
     unsafe { lainify_register_frame_sink() };
     let mut engine = QQmlApplicationEngine::new();

@@ -1,6 +1,6 @@
 # lainify
 
-A clean, low-latency desktop viewer for capture cards. It opens the card in its real formats, including uncompressed RGB 4:4:4, and takes lossless screenshots.
+A clean, low-latency desktop viewer for capture cards. It opens the card in its real formats, including uncompressed RGB 4:4:4, plays its audio, takes lossless screenshots and records with the GPU encoder, in 4:4:4 if you want.
 
 Built with Rust, Qt 6 / QML (through [cxx-qt](https://github.com/KDAB/cxx-qt)) and GStreamer. Linux only.
 
@@ -8,13 +8,17 @@ Built with Rust, Qt 6 / QML (through [cxx-qt](https://github.com/KDAB/cxx-qt)) a
 
 lainify started as a browser app, and browsers set a hard limit on picture quality. Chromium opens any capture card as MJPEG once the mode is larger than 640×480, processes video as 4:2:0 internally, and gives a web page no way to change either. A native app can open the card in whatever format it offers.
 
-With an Elgato 4K X, that means:
+With an Elgato 4K X on a 10 Gbps USB port, that means:
 
-| Mode         | Formats the card offers                       |
-| ------------ | --------------------------------------------- |
-| 1080p60      | RGB 4:4:4, YUV 4:2:2, 10-bit P010, NV12, MJPEG |
-| 4K30         | NV12 / I420 (uncompressed 4:2:0), MJPEG       |
-| 4K60 and up  | MJPEG only                                    |
+| Format                    | Largest modes                      |
+| ------------------------- | ---------------------------------- |
+| RGB 4:4:4 (uncompressed)  | 1080p120, 1440p60                  |
+| NV12 4:2:0 (uncompressed) | 4K60                               |
+| YUV 4:2:2 (uncompressed)  | 4K50                               |
+| 10-bit P010               | 4K30                               |
+| MJPEG                     | 4K144                              |
+
+On a 5 Gbps port the card offers far fewer uncompressed modes; check `lsusb -t` if the list looks short.
 
 ## Run
 
@@ -39,23 +43,38 @@ Run `v4l2-ctl --list-formats-ext -d /dev/video0` to see the modes your card real
 
 ## Using it
 
-- On launch it opens the first capture device in the best format it offers, preferring RGB 4:4:4 at 1080p60.
-- Device, Format, Resolution and Frame rate are listed from the card's real format list, so every combination shown is one the card offers.
-- The bar at the bottom shows the mode the card is actually delivering and the frame rate reaching the screen.
+- On launch it opens the capture device and mode you used last, or the first device at 1080p60 RGB 4:4:4. Plugging the card in later opens it automatically; unplugging shows a notice and resumes when it's back.
+- Settings (<kbd>,</kbd>) lists Device, Format, Resolution and Frame rate from the card's real format list, so every combination shown is one the card offers.
+- Audio follows the video device ("Match video device") or any input you pick, with volume up to 150%, mute and a level meter.
 - Screenshots are lossless PNGs in `~/Pictures/lainify`.
-- Shortcuts: <kbd>F</kbd> fullscreen, <kbd>Esc</kbd> leave fullscreen, <kbd>S</kbd> screenshot, <kbd>Space</kbd> start/stop.
+- Recordings go to `~/Videos/lainify`. Pick the encoder (NVENC H.264, HEVC or AV1 when there's an NVIDIA GPU, otherwise x264), bitrate, 4:2:0 or 4:4:4 colour (H.264/HEVC) and MKV or MP4. MKV stays playable if lainify crashes mid-recording; 4:4:4 files play in mpv and VLC but not in browsers or most editors.
+- Every choice is remembered in `~/.config/lainify/lainify.conf`.
 
-Not there yet: audio, recording, remembering your choices, hot-plug detection (press Refresh).
+| Key                          | Action                 |
+| ---------------------------- | ---------------------- |
+| <kbd>F</kbd> / double-click  | Fullscreen             |
+| <kbd>M</kbd>                 | Mute                   |
+| <kbd>↑</kbd> <kbd>↓</kbd>    | Volume                 |
+| <kbd>S</kbd>                 | Screenshot             |
+| <kbd>R</kbd>                 | Start / stop recording |
+| <kbd>,</kbd>                 | Settings               |
+| <kbd>Esc</kbd>               | Close panel / leave fullscreen |
 
 ## How it works
 
 ```
-device ! capsfilter [! jpegdec | ! videoflip] ! videoconvert ! appsink  →  QVideoFrame  →  VideoOutput
+video:  device ! capsfilter [! jpegdec | ! videoflip] ! videoconvert ! appsink ─→ QVideoFrame → VideoOutput
+audio:  device ! audioconvert ! audioresample ! tee ─┬→ level ! volume ! pulsesink
+                                                     └→ appsink
+record: appsrc (video) ! videoconvert ! encoder ! parser ─┬→ mux ! filesink
+        appsrc (audio) ! opusenc | avenc_aac ─────────────┘
 ```
 
-- `src/devices.rs` lists devices and their exact modes through GStreamer's device monitor.
-- `src/pipeline.rs` builds the pipeline for the chosen mode. `videoconvert` passes through every format Qt can draw and only converts the rest (24-bit BGR → BGRx, losslessly), so colour detail is never reduced. UVC cards send RGB bottom-up, so RGB frames go through `videoflip`.
+- `src/devices.rs` lists devices and their exact modes through GStreamer's device monitor, and keeps watching it for hot-plug.
+- `src/video.rs` builds the capture pipeline for the chosen mode. `videoconvert` passes through every format Qt can draw and only converts the rest (24-bit BGR → BGRx, losslessly), so colour detail is never reduced. UVC cards send RGB bottom-up, so RGB frames go through `videoflip`.
+- `src/audio.rs` plays the audio input and reports peak levels.
+- `src/recorder.rs` runs recording as its own pipeline, fed with the frames and samples the viewer already has, so starting or stopping a recording never interrupts the picture. Stopping sends end-of-stream so the file is finalised properly.
 - `cpp/frame_sink.*` copies each frame once into a `QVideoFrame` for the QML `VideoOutput`, keeping only the newest so a busy UI drops frames instead of lagging. It's the only hand-written C++, because cxx-qt-lib has no Qt Multimedia bindings.
-- `src/bridge/capture.rs` is the `Capture` object QML talks to; `qml/Main.qml` is the window.
+- `src/bridge/capture.rs` is the `Capture` object QML talks to. `qml/` is the UI, a port of the browser version's design: `Main.qml` wires it together, `components/` holds the small building blocks, and icons are [Lucide](https://lucide.dev) (ISC) with the Inter font (OFL), both in `assets/`.
 
 Qt sends its log to the systemd journal when stderr isn't a terminal; set `QT_FORCE_STDERR_LOGGING=1` (as `./run.sh debug` does) to see it.

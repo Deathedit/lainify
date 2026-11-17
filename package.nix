@@ -13,6 +13,7 @@ let
     qt6.qtbase
     qt6.qtdeclarative
     qt6.qtmultimedia
+    qt6.qtsvg # icons
   ];
   # cxx-qt-build needs one qmake that sees every module; the env tree provides it.
   qtEnv = qt6.env "qt-lainify-${qt6.qtbase.version}" qtModules;
@@ -20,7 +21,10 @@ let
   gst = with gst_all_1; [
     gstreamer
     gst-plugins-base # videoconvert, appsink
-    gst-plugins-good # v4l2src, jpegdec, pngenc, videoflip
+    gst-plugins-good # v4l2src, jpegdec, pngenc, videoflip, pulsesrc/sink, level, matroskamux, mp4mux
+    gst-plugins-bad # nvcodec (NVENC), h265parse, av1parse
+    gst-plugins-ugly # x264enc
+    gst-libav # avenc_aac
   ];
 in
 rustPlatform.buildRustPackage {
@@ -36,6 +40,7 @@ rustPlatform.buildRustPackage {
       ./src
       ./cpp
       ./qml
+      ./assets
     ];
   };
   cargoLock.lockFile = ./Cargo.lock;

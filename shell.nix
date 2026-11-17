@@ -17,12 +17,16 @@ let
     pkgs.qt6.qtbase
     pkgs.qt6.qtdeclarative
     pkgs.qt6.qtmultimedia
+    pkgs.qt6.qtsvg # icons
   ];
 
   gst = with pkgs.gst_all_1; [
     gstreamer
     gst-plugins-base # videoconvert, appsink
-    gst-plugins-good # v4l2src, jpegdec, pngenc
+    gst-plugins-good # v4l2src, jpegdec, pngenc, videoflip, pulsesrc/sink, level, matroskamux, mp4mux
+    gst-plugins-bad # nvcodec (NVENC), h265parse, av1parse
+    gst-plugins-ugly # x264enc
+    gst-libav # avenc_aac
   ];
 in
 pkgs.mkShell {

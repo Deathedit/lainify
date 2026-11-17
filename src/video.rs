@@ -16,6 +16,7 @@ use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 
 use crate::devices::MJPEG;
+use crate::recorder::Tap;
 
 /// Pixel formats Qt can draw, matching `LainifyFormat` in `cpp/frame_sink.h`.
 #[derive(Clone, Copy)]
@@ -81,9 +82,37 @@ pub struct Selection {
 
 /// Something the UI should hear about, sent from GStreamer threads.
 pub enum Event {
-    /// Frames are flowing; describes the negotiated source mode.
-    Live(String),
+    /// The device accepted the mode and is streaming.
+    Live(SourceMode),
     Error(String),
+}
+
+/// The mode the device is actually delivering.
+pub struct SourceMode {
+    pub width: i32,
+    pub height: i32,
+    /// Format id as in `devices` (`BGR`, `YUY2`, … or `MJPG`).
+    pub format: String,
+    pub fps: f64,
+}
+
+impl SourceMode {
+    /// e.g. `1920×1080 RGB 4:4:4 @ 60 fps`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}×{} {} @ {} fps",
+            self.width,
+            self.height,
+            crate::devices::short_label(&self.format),
+            format_fps(self.fps)
+        )
+    }
+}
+
+/// 60 → `60`, 59.94006 → `59.94`.
+pub fn format_fps(fps: f64) -> String {
+    let s = format!("{fps:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// A running capture. Stops when dropped.
@@ -98,6 +127,7 @@ pub struct Capture {
 impl Capture {
     pub fn start(
         sel: Selection,
+        tap: Tap,
         on_event: impl Fn(Event) + Send + 'static,
     ) -> Result<Self, String> {
         let src = sel
@@ -135,6 +165,8 @@ impl Capture {
             .build();
 
         let pipeline = gst::Pipeline::new();
+        // Shared time base with the audio pipeline, so recordings stay in sync.
+        pipeline.use_clock(Some(&gst::SystemClock::obtain()));
         let mut chain = vec![src, filter.clone()];
         if sel.format == MJPEG {
             chain.push(
@@ -167,6 +199,7 @@ impl Capture {
                     move |sink| {
                         let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                         present(&sample);
+                        tap.push_video(&sample, sink.base_time());
                         frames.fetch_add(1, Ordering::Relaxed);
                         *last.lock().unwrap() = Some(sample);
                         Ok(gst::FlowSuccess::Ok)
@@ -255,25 +288,22 @@ fn watch_bus(
     }
 }
 
-fn describe_source(filter: &gst::Element) -> String {
-    let Some(caps) = filter.static_pad("src").and_then(|p| p.current_caps()) else {
-        return String::new();
-    };
-    let Some(s) = caps.structure(0) else {
-        return String::new();
-    };
-    let format = if s.name() == "image/jpeg" {
-        "MJPEG".to_string()
-    } else {
-        s.get::<&str>("format").unwrap_or("?").to_string()
-    };
-    let w = s.get::<i32>("width").unwrap_or(0);
-    let h = s.get::<i32>("height").unwrap_or(0);
-    let fps = s
-        .get::<gst::Fraction>("framerate")
-        .map(|f| format!("{:.2}", f.numer() as f64 / f.denom() as f64))
-        .unwrap_or_else(|_| "?".into());
-    format!("{w}×{h} {format} @ {} fps", fps.trim_end_matches(".00"))
+fn describe_source(filter: &gst::Element) -> SourceMode {
+    let caps = filter.static_pad("src").and_then(|p| p.current_caps());
+    let s = caps.as_ref().and_then(|c| c.structure(0));
+    SourceMode {
+        width: s.and_then(|s| s.get::<i32>("width").ok()).unwrap_or(0),
+        height: s.and_then(|s| s.get::<i32>("height").ok()).unwrap_or(0),
+        format: match s {
+            Some(s) if s.name() == "image/jpeg" => MJPEG.to_string(),
+            Some(s) => s.get::<&str>("format").unwrap_or("").to_string(),
+            None => String::new(),
+        },
+        fps: s
+            .and_then(|s| s.get::<gst::Fraction>("framerate").ok())
+            .map(|f| f.numer() as f64 / f.denom().max(1) as f64)
+            .unwrap_or(0.0),
+    }
 }
 
 fn present(sample: &gst::Sample) {
@@ -349,4 +379,16 @@ pub fn encode_png(sample: &gst::Sample) -> Result<Vec<u8>, String> {
     let buffer = png.buffer().ok_or("No PNG data")?;
     let map = buffer.map_readable().map_err(|e| e.to_string())?;
     Ok(map.as_slice().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_fps;
+
+    #[test]
+    fn formats_fps() {
+        assert_eq!(format_fps(60.0), "60");
+        assert_eq!(format_fps(60000.0 / 1001.0), "59.94");
+        assert_eq!(format_fps(29.5), "29.5");
+    }
 }

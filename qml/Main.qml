@@ -1,6 +1,6 @@
 import QtQuick
-import QtQuick.Controls
-import QtQuick.Layouts
+import QtQuick.Controls.Basic
+import QtCore
 import QtMultimedia
 import com.lainify
 import com.lainify.native
@@ -10,339 +10,488 @@ ApplicationWindow {
 
     width: 1280
     height: 760
+    minimumWidth: 480
+    minimumHeight: 320
     visible: true
-    title: "lainify"
     color: "black"
+    title: live && capture.deviceName ? `${capture.deviceName} · lainify` : "lainify"
+    font.family: Theme.font
+    font.features: Theme.fontFeatures
 
-    palette.window: "#18181b"
-    palette.windowText: "#e4e4e7"
-    palette.base: "#27272a"
-    palette.alternateBase: "#3f3f46"
-    palette.text: "#e4e4e7"
-    palette.button: "#27272a"
-    palette.buttonText: "#e4e4e7"
-    palette.highlight: "#8b5cf6"
-    palette.highlightedText: "#ffffff"
-    palette.placeholderText: "#71717a"
-    palette.mid: "#3f3f46"
-    palette.dark: "#09090b"
-    palette.light: "#52525b"
+    FontLoader {
+        id: inter
+        source: "qrc:/qt/qml/com/lainify/assets/InterVariable.ttf"
+        onStatusChanged: if (status === FontLoader.Ready)
+            Theme.font = name
+    }
 
-    // ── State ────────────────────────────────────────────────────────────────
+    // Remembered between runs (~/.config/lainify/lainify.conf).
+    Settings {
+        id: prefs
+        property string videoDevice: ""
+        property string format: "BGR"
+        property int width: 1920
+        property int height: 1080
+        property real fps: 60
+        property string audio: "auto"
+        property real volume: 1
+        property bool muted: false
+        property string encoder: ""
+        property int bitrate: 12000
+        property bool chroma444: false
+        property string container: "mkv"
+        property int hideDelay: 2500
+    }
 
-    readonly property var devices: {
+    // ── Devices and the current selection ────────────────────────────────────
+
+    function parse(json, fallback) {
         try {
-            return JSON.parse(capture.devicesJson || "[]");
+            return JSON.parse(json || "null") ?? fallback;
         } catch (e) {
-            return [];
+            return fallback;
         }
-    }
-    // The selection is derived from what the user asked for (want*), falling back to the closest
-    // mode the device has, so switching format or device keeps as much of the choice as it can.
-    readonly property int deviceIndex: devices.length ? Math.min(wantDevice, devices.length - 1) : -1
-    readonly property var device: devices[deviceIndex] ?? null
-    readonly property int formatIndex: device ? pick(device.formats, f => f.id === wantFormat) : -1
-    readonly property var format: device ? (device.formats[formatIndex] ?? null) : null
-    readonly property int sizeIndex: format ? pick(format.sizes, s => s.width === wantWidth && s.height === wantHeight) : -1
-    readonly property var size: format ? (format.sizes[sizeIndex] ?? null) : null
-    readonly property int rateIndex: size ? closestRate(size.rates) : -1
-    readonly property var rate: size ? (size.rates[rateIndex] ?? null) : null
-
-    readonly property bool live: capture.status === "live"
-    readonly property bool running: capture.status === "live" || capture.status === "starting"
-
-    // What the user last asked for; kept when switching format or device.
-    property int wantDevice: 0
-    property string wantFormat: "BGR"
-    property int wantWidth: 1920
-    property int wantHeight: 1080
-    property real wantFps: 60
-    property bool autoStarted: false
-
-    function fpsOf(r) {
-        return r.num / r.den;
-    }
-    function fpsLabel(r) {
-        const f = fpsOf(r);
-        return (Number.isInteger(f) ? f.toString() : f.toFixed(2)) + " fps";
     }
     function pick(list, pred) {
         const i = list.findIndex(pred);
         return i < 0 ? 0 : i;
     }
-    function closestRate(rates) {
-        let best = 0;
-        for (let i = 1; i < rates.length; ++i) {
-            if (Math.abs(fpsOf(rates[i]) - wantFps) < Math.abs(fpsOf(rates[best]) - wantFps))
-                best = i;
-        }
+    function fpsOf(r) {
+        return r.num / r.den;
+    }
+
+    readonly property var devices: parse(capture.devicesJson, [])
+    readonly property var audioDevices: parse(capture.audioDevicesJson, [])
+    readonly property var encoders: parse(capture.encodersJson, [])
+
+    // Derived from what the user asked for (prefs), falling back to the closest mode the device
+    // has, so switching device or format keeps as much of the choice as it can.
+    readonly property int deviceIndex: devices.length ? pick(devices, d => d.name === prefs.videoDevice) : -1
+    readonly property var device: devices[deviceIndex] ?? null
+    readonly property var format: device ? device.formats[pick(device.formats, f => f.id === prefs.format)] : null
+    readonly property var size: format ? format.sizes[pick(format.sizes, s => s.width === prefs.width && s.height === prefs.height)] : null
+    readonly property var rate: {
+        if (!size)
+            return null;
+        let best = size.rates[0];
+        for (const r of size.rates)
+            if (Math.abs(fpsOf(r) - prefs.fps) < Math.abs(fpsOf(best) - prefs.fps))
+                best = r;
         return best;
+    }
+    readonly property var encoder: encoders.find(e => e.id === prefs.encoder) ?? encoders[0] ?? null
+
+    // ── State ────────────────────────────────────────────────────────────────
+
+    readonly property bool live: capture.status === "live"
+    readonly property bool running: live || capture.status === "starting"
+    readonly property bool hasAudio: capture.audioStatus === "live"
+    property bool userStopped: false
+    property bool panelOpen: false
+    property bool idle: false
+    readonly property bool fullscreen: visibility === Window.FullScreen
+    readonly property bool uiVisible: !live || !idle || panelOpen || controls.hovered
+
+    readonly property string phase: {
+        if (live || !capture.ready)
+            return "";
+        switch (capture.status) {
+        case "starting":
+            return "starting";
+        case "error":
+            return "error";
+        case "lost":
+            return "lost";
+        }
+        if (devices.length === 0)
+            return "welcome";
+        return userStopped ? "stopped" : "starting";
     }
 
     function startCapture() {
         if (!device || !format || !size || !rate)
             return;
+        userStopped = false;
+        prefs.videoDevice = device.name;
+        capture.setAudio(prefs.audio);
+        capture.setVolume(prefs.volume, prefs.muted);
         capture.start(deviceIndex, format.id, size.width, size.height, rate.num, rate.den);
     }
-    function autoStart() {
-        if (!autoStarted && devices.length > 0) {
-            autoStarted = true;
+    function stopCapture() {
+        userStopped = true;
+        capture.stop();
+    }
+    /// After a selection change: reopen if we were capturing (or trying to).
+    function reopen() {
+        if (["live", "starting", "error"].includes(capture.status) || (capture.status === "idle" && !userStopped))
+            Qt.callLater(startCapture);
+    }
+    function onDevicesUpdated() {
+        if (capture.status === "lost" && devices.some(d => d.name === capture.deviceName)) {
+            toasts.show("Capture device reconnected", "success");
+            prefs.videoDevice = capture.deviceName;
+            startCapture();
+        } else if (capture.status === "idle" && !userStopped && devices.length > 0) {
             startCapture();
         }
     }
-    function restartIfRunning() {
-        if (running)
-            Qt.callLater(startCapture);
+    function setVolume(value) {
+        prefs.volume = Math.round(Math.max(0, Math.min(1.5, value)) * 100) / 100;
+        prefs.muted = false;
+        capture.setVolume(prefs.volume, prefs.muted);
+    }
+    function toggleMute() {
+        prefs.muted = !prefs.muted;
+        capture.setVolume(prefs.volume, prefs.muted);
+    }
+    function screenshot() {
+        if (!live)
+            return;
+        flash.restart();
+        capture.screenshot();
+    }
+    function toggleRecording() {
+        if (capture.recording)
+            capture.stopRecording();
+        else if (live && !capture.saving && encoder)
+            capture.startRecording(encoder.id, prefs.bitrate, prefs.chroma444, prefs.container);
     }
     function toggleFullscreen() {
-        win.visibility = win.visibility === Window.FullScreen ? Window.Windowed : Window.FullScreen;
+        win.visibility = fullscreen ? Window.Windowed : Window.FullScreen;
+    }
+    function poke() {
+        idle = false;
+        if (prefs.hideDelay > 0)
+            idleTimer.restart();
+        else
+            idleTimer.stop();
     }
 
     Capture {
         id: capture
 
-        onNotice: (text, error) => toast.show(text, error)
-        // Deferred: this handler can run before the `devices` binding has re-evaluated.
-        onDevicesJsonChanged: Qt.callLater(win.autoStart)
-        Component.onCompleted: refresh()
+        onNotice: (text, tone) => toasts.show(text, tone)
+        // Deferred: the handler can run before bindings on devicesJson have re-evaluated.
+        onDevicesJsonChanged: Qt.callLater(win.onDevicesUpdated)
+        onReadyChanged: Qt.callLater(win.onDevicesUpdated)
     }
 
     Timer {
         interval: 1000
         repeat: true
-        running: win.running
+        running: win.running || capture.recording
         onTriggered: capture.tick()
     }
 
-    // ── Picture ──────────────────────────────────────────────────────────────
-
-    VideoOutput {
-        id: video
-
-        anchors.fill: parent
-        fillMode: VideoOutput.PreserveAspectFit
-        Component.onCompleted: FrameSink.videoSink = video.videoSink
-    }
-
-    Column {
-        anchors.centerIn: parent
-        spacing: 8
-        visible: !win.live
-
-        Label {
-            anchors.horizontalCenter: parent.horizontalCenter
-            font.pixelSize: 20
-            color: "#e4e4e7"
-            text: win.devices.length === 0 ? "No capture device found"
-                : capture.status === "starting" ? "Starting…"
-                : capture.status === "error" ? "Capture failed"
-                : "Stopped"
-        }
-        Label {
-            anchors.horizontalCenter: parent.horizontalCenter
-            color: "#a1a1aa"
-            text: win.devices.length === 0 ? "Plug in a card, then press Refresh." : "Pick a mode below and press Start."
-        }
-    }
-
-    // ── Controls (hide after a few idle seconds while live) ─────────────────
-
-    property bool idle: false
-
     Timer {
         id: idleTimer
-        interval: 2500
+        interval: Math.max(500, prefs.hideDelay)
         onTriggered: win.idle = true
     }
 
-    MouseArea {
+    Rectangle {
+        id: stage
         anchors.fill: parent
-        hoverEnabled: true
-        acceptedButtons: Qt.NoButton
-        cursorShape: win.live && win.idle ? Qt.BlankCursor : Qt.ArrowCursor
-        onPositionChanged: {
-            win.idle = false;
-            idleTimer.restart();
-        }
-    }
+        color: "black"
 
-    Rectangle {
-        id: bar
+        // ── Picture ──────────────────────────────────────────────────────────────
 
-        readonly property bool shown: !win.live || !win.idle || barHover.hovered
-
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: 16
-        width: Math.min(parent.width - 32, controls.implicitWidth + 24)
-        height: controls.implicitHeight + 20
-        radius: 14
-        color: "#d918181b"
-        border.color: "#33ffffff"
-        opacity: shown ? 1 : 0
-        visible: opacity > 0
-
-        Behavior on opacity {
-            NumberAnimation {
-                duration: 200
-            }
-        }
-
-        HoverHandler {
-            id: barHover
-        }
-
-        ColumnLayout {
-            id: controls
-
+        VideoOutput {
+            id: video
             anchors.fill: parent
-            anchors.margins: 10
-            spacing: 8
-
-            RowLayout {
-                spacing: 8
-
-                ComboBox {
-                    id: deviceBox
-                    Layout.preferredWidth: 200
-                    model: win.devices.map(d => d.name)
-                    currentIndex: win.deviceIndex
-                    enabled: win.devices.length > 0
-                    onActivated: index => {
-                        win.wantDevice = index;
-                        win.restartIfRunning();
-                    }
-                }
-                ComboBox {
-                    id: formatBox
-                    Layout.preferredWidth: 270
-                    model: win.device ? win.device.formats.map(f => f.label) : []
-                    currentIndex: win.formatIndex
-                    onActivated: index => {
-                        win.wantFormat = win.device.formats[index].id;
-                        win.restartIfRunning();
-                    }
-                }
-                ComboBox {
-                    id: sizeBox
-                    Layout.preferredWidth: 130
-                    model: win.format ? win.format.sizes.map(s => `${s.width}×${s.height}`) : []
-                    currentIndex: win.sizeIndex
-                    onActivated: index => {
-                        win.wantWidth = win.format.sizes[index].width;
-                        win.wantHeight = win.format.sizes[index].height;
-                        win.restartIfRunning();
-                    }
-                }
-                ComboBox {
-                    id: rateBox
-                    Layout.preferredWidth: 110
-                    model: win.size ? win.size.rates.map(r => win.fpsLabel(r)) : []
-                    currentIndex: win.rateIndex
-                    onActivated: index => {
-                        win.wantFps = win.fpsOf(win.size.rates[index]);
-                        win.restartIfRunning();
-                    }
+            fillMode: VideoOutput.PreserveAspectFit
+            opacity: win.live ? 1 : 0
+            Behavior on opacity {
+                NumberAnimation {
+                    duration: 500
                 }
             }
-
-            RowLayout {
-                spacing: 8
-
-                Button {
-                    text: win.running ? "Stop" : "Start"
-                    highlighted: !win.running
-                    enabled: win.running || win.rate !== null
-                    onClicked: win.running ? capture.stop() : win.startCapture()
-                }
-                Button {
-                    text: "Screenshot"
-                    enabled: win.live
-                    onClicked: capture.screenshot()
-                }
-                Button {
-                    text: win.visibility === Window.FullScreen ? "Exit fullscreen" : "Fullscreen"
-                    onClicked: win.toggleFullscreen()
-                }
-                Button {
-                    text: "Refresh"
-                    enabled: !win.running
-                    onClicked: capture.refresh()
-                }
-                Label {
-                    Layout.fillWidth: true
-                    horizontalAlignment: Text.AlignRight
-                    color: "#a1a1aa"
-                    font.features: { "tnum": 1 }
-                    text: win.live ? `${capture.delivering}  ·  showing ${capture.fps.toFixed(1)} fps` : ""
-                }
-            }
-        }
-    }
-
-    // ── Toast ────────────────────────────────────────────────────────────────
-
-    Rectangle {
-        id: toast
-
-        property bool error: false
-
-        function show(text, isError) {
-            toastText.text = text;
-            error = isError;
-            opacity = 1;
-            toastTimer.restart();
+            Component.onCompleted: FrameSink.videoSink = video.videoSink
         }
 
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.top: parent.top
-        anchors.topMargin: 16
-        width: Math.min(parent.width - 32, toastText.implicitWidth + 28)
-        height: toastText.implicitHeight + 16
-        radius: 10
-        color: error ? "#e67f1d1d" : "#e618181b"
-        border.color: "#33ffffff"
-        opacity: 0
-        visible: opacity > 0
+        // Movement shows the controls; double-click toggles fullscreen.
+        MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: win.uiVisible ? Qt.ArrowCursor : Qt.BlankCursor
+            onPositionChanged: win.poke()
+            onPressed: win.poke()
+            onDoubleClicked: if (win.live)
+                win.toggleFullscreen()
+        }
 
-        Behavior on opacity {
+        Rectangle {
+            id: flashRect
+            anchors.fill: parent
+            color: "white"
+            opacity: 0
             NumberAnimation {
-                duration: 200
+                id: flash
+                target: flashRect
+                property: "opacity"
+                from: 0.55
+                to: 0
+                duration: 450
+                easing.type: Easing.OutQuad
             }
         }
 
-        Label {
-            id: toastText
-            anchors.centerIn: parent
-            width: Math.min(implicitWidth, parent.parent.width - 60)
-            wrapMode: Text.Wrap
-            color: "#f4f4f5"
+        EmptyState {
+            visible: win.phase !== ""
+            phase: win.phase
+            deviceName: capture.deviceName || (win.device ? win.device.name : "")
+            errorTitle: capture.errorTitle
+            errorMessage: capture.errorMessage
+            onStartRequested: win.startCapture()
+            onRefresh: capture.refresh()
+            onOpenSettings: win.panelOpen = true
         }
 
-        Timer {
-            id: toastTimer
-            interval: 4000
-            onTriggered: toast.opacity = 0
+        StatusPill {
+            shown: win.uiVisible
+            live: win.live
+            recording: capture.recording
+            elapsed: capture.recordSeconds
+            deviceName: capture.deviceName
+            details: {
+                const parts = [];
+                if (capture.videoWidth)
+                    parts.push(`${capture.videoWidth}×${capture.videoHeight}`);
+                const fps = capture.fps > 0 ? Math.round(capture.fps * 10) / 10 : (win.rate ? win.fpsOf(win.rate) : 0);
+                if (fps)
+                    parts.push(`${Theme.fps(fps)} fps`);
+                if (win.hasAudio && capture.audioInfo)
+                    parts.push(capture.audioInfo);
+                return parts.join(" · ");
+            }
+        }
+
+        ControlBar {
+            id: controls
+            visible: capture.ready
+            shown: win.uiVisible
+            live: win.live
+            running: win.running
+            hasAudio: win.hasAudio
+            volume: prefs.volume
+            muted: prefs.muted
+            levelLeft: capture.levelLeft
+            levelRight: capture.levelRight
+            recording: capture.recording
+            saving: capture.saving
+            elapsed: capture.recordSeconds
+            fullscreen: win.fullscreen
+            panelOpen: win.panelOpen
+            onPower: win.running ? win.stopCapture() : win.startCapture()
+            onScreenshot: win.screenshot()
+            onRecord: win.toggleRecording()
+            onSettings: win.panelOpen = !win.panelOpen
+            onToggleFullscreen: win.toggleFullscreen()
+            onVolumeMoved: value => win.setVolume(value)
+            onMuteToggled: win.toggleMute()
+        }
+
+        SettingsPanel {
+            id: panel
+
+            open: win.panelOpen
+            onCloseRequested: win.panelOpen = false
+            recording: capture.recording
+
+            videoOptions: win.devices.map(d => ({
+                        "value": d.name,
+                        "label": d.name
+                    }))
+            videoValue: win.device ? win.device.name : ""
+            onVideoChanged: v => {
+                prefs.videoDevice = v;
+                win.reopen();
+            }
+
+            formatOptions: win.device ? win.device.formats.map(f => ({
+                        "value": f.id,
+                        "label": f.label
+                    })) : []
+            formatValue: win.format ? win.format.id : ""
+            onFormatChanged: v => {
+                prefs.format = v;
+                win.reopen();
+            }
+
+            sizeOptions: win.format ? win.format.sizes.map(s => ({
+                        "value": `${s.width}x${s.height}`,
+                        "label": `${s.width}×${s.height}`
+                    })) : []
+            sizeValue: win.size ? `${win.size.width}x${win.size.height}` : ""
+            onSizeChanged: v => {
+                const [w, h] = v.split("x").map(Number);
+                prefs.width = w;
+                prefs.height = h;
+                win.reopen();
+            }
+
+            rateOptions: win.size ? win.size.rates.map(r => ({
+                        "value": `${r.num}/${r.den}`,
+                        "label": `${Theme.fps(win.fpsOf(r))} fps`
+                    })) : []
+            rateValue: win.rate ? `${win.rate.num}/${win.rate.den}` : ""
+            onRateChanged: v => {
+                const [n, d] = v.split("/").map(Number);
+                prefs.fps = n / d;
+                win.reopen();
+            }
+
+            videoInfo: win.live ? `Delivering ${capture.delivering}${capture.fps > 0 ? ` · showing ${capture.fps.toFixed(1)} fps` : ""}` : ""
+
+            audioOptions: [
+                {
+                    "value": "auto",
+                    "label": "Match video device"
+                },
+                {
+                    "value": "none",
+                    "label": "No audio"
+                }
+            ].concat(win.audioDevices.map(n => ({
+                        "value": n,
+                        "label": n
+                    })))
+            audioValue: prefs.audio
+            onAudioChanged: v => {
+                prefs.audio = v;
+                capture.setAudio(v);
+            }
+            audioInfo: {
+                switch (capture.audioStatus) {
+                case "live":
+                    return [capture.audioName, capture.audioInfo].filter(Boolean).join(" · ");
+                case "starting":
+                    return `Opening ${capture.audioName}…`;
+                case "error":
+                    return `${capture.audioName || "The audio input"} could not be opened.`;
+                case "missing":
+                    return prefs.audio === "auto" ? "No audio input matches this device. Pick one above, or choose No audio." : "That audio input isn't connected.";
+                }
+                return "";
+            }
+
+            encoderOptions: win.encoders.map(e => ({
+                        "value": e.id,
+                        "label": e.label
+                    }))
+            encoderValue: win.encoder ? win.encoder.id : ""
+            onEncoderChanged: v => prefs.encoder = v
+
+            readonly property int recommended: win.size && win.size.height >= 2160 ? 40 : win.size && win.size.height >= 1440 ? 20 : 12
+            bitrateOptions: [6, 12, 20, 40, 80].map(m => ({
+                        "value": String(m * 1000),
+                        "label": `${m} Mbps${m === recommended ? " (recommended)" : ""}`
+                    }))
+            bitrateValue: String(prefs.bitrate)
+            onBitrateChanged: v => prefs.bitrate = Number(v)
+
+            chromaAvailable: win.encoder ? win.encoder.supports444 : false
+            chromaOptions: [
+                {
+                    "value": "420",
+                    "label": "4:2:0 — plays everywhere"
+                },
+                {
+                    "value": "444",
+                    "label": "4:4:4 — full colour"
+                }
+            ]
+            chromaValue: prefs.chroma444 ? "444" : "420"
+            onChromaChanged: v => prefs.chroma444 = v === "444"
+
+            containerOptions: [
+                {
+                    "value": "mkv",
+                    "label": "MKV — survives crashes"
+                },
+                {
+                    "value": "mp4",
+                    "label": "MP4"
+                }
+            ]
+            containerValue: prefs.container
+            onContainerChanged: v => prefs.container = v
+
+            hideOptions: [
+                {
+                    "value": "1500",
+                    "label": "After 1.5 s"
+                },
+                {
+                    "value": "2500",
+                    "label": "After 2.5 s"
+                },
+                {
+                    "value": "5000",
+                    "label": "After 5 s"
+                },
+                {
+                    "value": "0",
+                    "label": "Never"
+                }
+            ]
+            hideValue: String(prefs.hideDelay)
+            onHideChanged: v => {
+                prefs.hideDelay = Number(v);
+                win.poke();
+            }
+
+            screenshotDir: capture.screenshotDir
+            recordingDir: capture.recordingDir
+        }
+
+        Toasts {
+            id: toasts
         }
     }
 
-    // ── Shortcuts ────────────────────────────────────────────────────────────
+    // ── Shortcuts (same keys as the browser version) ─────────────────────────
 
     Shortcut {
         sequence: "F"
         onActivated: win.toggleFullscreen()
     }
     Shortcut {
-        sequence: "Escape"
-        enabled: win.visibility === Window.FullScreen
-        onActivated: win.visibility = Window.Windowed
+        sequence: "M"
+        enabled: win.hasAudio
+        onActivated: win.toggleMute()
+    }
+    Shortcut {
+        sequence: "Up"
+        autoRepeat: true
+        onActivated: win.setVolume(prefs.volume + 0.05)
+    }
+    Shortcut {
+        sequence: "Down"
+        autoRepeat: true
+        onActivated: win.setVolume(prefs.volume - 0.05)
     }
     Shortcut {
         sequence: "S"
-        onActivated: if (win.live) capture.screenshot()
+        onActivated: win.screenshot()
     }
     Shortcut {
-        sequence: "Space"
-        onActivated: win.running ? capture.stop() : win.startCapture()
+        sequence: "R"
+        onActivated: win.toggleRecording()
     }
+    Shortcut {
+        sequence: ","
+        onActivated: win.panelOpen = !win.panelOpen
+    }
+    Shortcut {
+        sequence: "Escape"
+        onActivated: {
+            if (win.panelOpen)
+                win.panelOpen = false;
+            else if (win.fullscreen)
+                win.visibility = Window.Windowed;
+        }
+    }
+
+    Component.onCompleted: poke()
 }
