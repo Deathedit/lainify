@@ -118,9 +118,6 @@
 					value={modeValue}
 					options={modeOptions}
 					disabled={modeLocked}
-					hint={modeLocked
-						? 'Stop recording to change the mode.'
-						: 'Only modes within the device’s reported limits are listed.'}
 					onchange={onmode}
 				/>
 				{@render info(videoInfo)}
