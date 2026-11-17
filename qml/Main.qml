@@ -398,7 +398,7 @@ ApplicationWindow {
                 }
                 return "";
             }
-            audioWarning: capture.audioLoss > 0 ? `The capture card is dropping about ${capture.audioLoss < 0.01 ? "0.01" : capture.audioLoss.toFixed(2)}% of its audio in this mode, which sounds like crackling. Some cards do this in 4K uncompressed modes; MJPEG or a lower resolution usually avoids it.` : ""
+            audioWarning: capture.audioLoss > 0 ? `The capture card is dropping about ${capture.audioLoss < 0.01 ? "0.01" : capture.audioLoss.toFixed(2)}% of its audio in this mode, which sounds like crackling. Usually the USB controller is missing audio packets under heavy video: try another 10 Gbps port (one on the CPU's own controller, not the chipset's). MJPEG or a lower resolution also avoids it.` : ""
 
             encoderOptions: win.encoders.map(e => ({
                         "value": e.id,

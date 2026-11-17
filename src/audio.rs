@@ -79,7 +79,8 @@ impl AudioCapture {
         let tee = make("tee")?;
 
         // Count what actually arrives (after conversion: F32 stereo, 8 bytes a frame). Some
-        // capture cards silently drop audio in heavy video modes, which is heard as crackling.
+        // setups silently lose audio under heavy video (e.g. a USB controller missing packets),
+        // which is heard as crackling.
         let meter = Mutex::new(RateMeter::new(48_000.0));
         let started = Instant::now();
         caps.static_pad("src")

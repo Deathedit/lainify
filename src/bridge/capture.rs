@@ -525,7 +525,7 @@ impl qobject::Capture {
                         if losing && !this.rust().loss_warned {
                             this.as_mut().rust_mut().loss_warned = true;
                             this.notify(
-                                "The capture card is dropping audio in this mode — see Settings",
+                                "Audio is dropping out (crackling) — see Settings → Audio",
                                 "error",
                             );
                         }
