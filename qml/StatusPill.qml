@@ -12,6 +12,10 @@ Row {
     property string details
     property bool recording: false
     property real elapsed: 0
+    /// Replay buffer running: show how much it holds.
+    property bool replay: false
+    property real replayBuffered: 0
+    property int replayLength: 60
 
     x: 16
     y: 16
@@ -143,6 +147,33 @@ Row {
                 font.weight: Font.Medium
                 font.features: Theme.tabular
                 color: Theme.zinc400
+            }
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: pills.replay
+                width: 1
+                height: 12
+                color: Theme.white(0.15)
+            }
+            Row {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: pills.replay
+                spacing: 5
+                Icon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "history"
+                    size: 12
+                    color: Theme.accent300
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: Theme.duration(Math.min(pills.replayBuffered, pills.replayLength))
+                    font.family: Theme.font
+                    font.pixelSize: 12
+                    font.weight: Font.Medium
+                    font.features: Theme.tabular
+                    color: Theme.zinc400
+                }
             }
         }
     }

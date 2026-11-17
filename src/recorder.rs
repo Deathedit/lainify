@@ -3,8 +3,10 @@
 //!
 //! `appsrc ! queue ! videoconvert ! encoder ! parser ! mux ! filesink`, plus an audio branch.
 //! Both capture pipelines run on the system clock; each buffer's absolute time
-//! (`pts + base_time`) minus the recording's start time becomes its timestamp in the file, which
-//! keeps picture and sound in sync even though they come from different pipelines.
+//! (`pts + base_time`) minus the consumer's start time becomes its timestamp, which keeps
+//! picture and sound in sync even though they come from different pipelines.
+//!
+//! The encoder chains and the [`Tap`] are shared with the replay buffer (`replay.rs`).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +64,29 @@ impl Encoder {
         }
     }
 
+    /// What the parser hands the muxer. Both matroskamux and mp4mux take exactly these, so
+    /// encoded buffers can be stored and muxed later (the replay buffer relies on it).
+    fn output_caps(self) -> gst::Caps {
+        match self {
+            Self::NvH264 | Self::X264 => gst::Caps::builder("video/x-h264")
+                .field("stream-format", "avc")
+                .field("alignment", "au")
+                .build(),
+            Self::NvH265 => gst::Caps::builder("video/x-h265")
+                .field("stream-format", "hvc1")
+                .field("alignment", "au")
+                .build(),
+            Self::NvAv1 => gst::Caps::builder("video/x-av1")
+                .field("stream-format", "obu-stream")
+                .field("alignment", "tu")
+                .build(),
+        }
+    }
+
+    pub fn is_hardware(self) -> bool {
+        self != Self::X264
+    }
+
     /// Caps after the encoder that pin its profile. Left open, nvh264enc settles on
     /// constrained-baseline (no CABAC, no B-frames), which wastes bitrate.
     fn profile(self, chroma_444: bool) -> Option<gst::Caps> {
@@ -104,7 +129,7 @@ impl Container {
         if id == "mp4" { Self::Mp4 } else { Self::Mkv }
     }
 
-    fn extension(self) -> &'static str {
+    pub fn extension(self) -> &'static str {
         match self {
             Self::Mkv => "mkv",
             Self::Mp4 => "mp4",
@@ -118,12 +143,16 @@ pub struct Options {
     pub chroma_444: bool,
     pub container: Container,
     pub fps: f64,
+    /// Distance between keyframes. Clips can only start on one.
+    pub keyframe_seconds: f64,
 }
 
-/// Where captured buffers go while a recording runs. Cloned into both capture pipelines.
+/// Where captured buffers go: every running consumer (a recording, the replay buffer).
+/// Cloned into both capture pipelines.
 #[derive(Clone, Default)]
-pub struct Tap(Arc<Mutex<Option<Arc<Feed>>>>);
+pub struct Tap(Arc<Mutex<Vec<Arc<Feed>>>>);
 
+/// One consumer's inputs.
 pub struct Feed {
     video: gst_app::AppSrc,
     audio: Option<gst_app::AppSrc>,
@@ -131,27 +160,53 @@ pub struct Feed {
     t0: gst::ClockTime,
 }
 
-impl Tap {
-    fn set(&self, feed: Option<Arc<Feed>>) {
-        *self.0.lock().unwrap() = feed;
+impl Feed {
+    /// Timestamps start from now.
+    pub fn new(
+        video: gst_app::AppSrc,
+        audio: Option<gst_app::AppSrc>,
+        video_caps: gst::Caps,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            video,
+            audio,
+            video_caps,
+            t0: gst::SystemClock::obtain().time(),
+        })
     }
 
-    fn get(&self) -> Option<Arc<Feed>> {
-        self.0.lock().unwrap().clone()
+    /// Tell the encoders no more input is coming.
+    pub fn end(&self) {
+        let _ = self.video.end_of_stream();
+        if let Some(audio) = &self.audio {
+            let _ = audio.end_of_stream();
+        }
+    }
+}
+
+impl Tap {
+    pub fn add(&self, feed: Arc<Feed>) {
+        self.0.lock().unwrap().push(feed);
+    }
+
+    pub fn remove(&self, feed: &Arc<Feed>) {
+        self.0.lock().unwrap().retain(|f| !Arc::ptr_eq(f, feed));
     }
 
     pub fn push_video(&self, sample: &gst::Sample, base_time: Option<gst::ClockTime>) {
-        let Some(feed) = self.get() else { return };
-        if sample.caps().is_some_and(|c| *c != feed.video_caps) {
-            return; // mode changed mid-recording; the UI prevents this
+        for feed in self.0.lock().unwrap().iter() {
+            if sample.caps().is_some_and(|c| *c != feed.video_caps) {
+                continue; // mode changed; the consumer is restarted or the UI prevents it
+            }
+            push(&feed.video, sample, base_time, feed.t0);
         }
-        push(&feed.video, sample, base_time, feed.t0);
     }
 
     pub fn push_audio(&self, sample: &gst::Sample, base_time: Option<gst::ClockTime>) {
-        let Some(feed) = self.get() else { return };
-        if let Some(audio) = &feed.audio {
-            push(audio, sample, base_time, feed.t0);
+        for feed in self.0.lock().unwrap().iter() {
+            if let Some(audio) = &feed.audio {
+                push(audio, sample, base_time, feed.t0);
+            }
         }
     }
 }
@@ -211,116 +266,15 @@ impl Recording {
             opts.container.extension()
         ));
 
-        let make = |factory: &str| {
-            gst::ElementFactory::make(factory)
-                .build()
-                .map_err(|_| format!("GStreamer element '{factory}' is missing"))
-        };
         let pipeline = gst::Pipeline::new();
-
-        // ── Video ──
-        let video_src = gst_app::AppSrc::builder()
-            .caps(&video_caps)
-            .format(gst::Format::Time)
-            .build();
-        let queue = gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 0u32)
-            .property("max-size-bytes", 0u32)
-            .property("max-size-time", 2_000_000_000u64)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let convert = gst::ElementFactory::make("videoconvert")
-            .property("n-threads", 4u32)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let chroma_444 = opts.chroma_444 && opts.encoder.supports_444();
-        let format = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst::Caps::builder("video/x-raw")
-                    .field("format", if chroma_444 { "Y444" } else { "NV12" })
-                    .build(),
-            )
-            .build()
-            .map_err(|e| e.to_string())?;
-        let encoder = make(opts.encoder.factory())?;
-        configure_encoder(&encoder, &opts);
-        let profile = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                opts.encoder
-                    .profile(chroma_444)
-                    .unwrap_or_else(gst::Caps::new_any),
-            )
-            .build()
-            .map_err(|e| e.to_string())?;
-        let parser = make(opts.encoder.parser())?;
-        let video_out = make("queue")?;
-
-        let mux = make(match opts.container {
-            Container::Mkv => "matroskamux",
-            Container::Mp4 => "mp4mux",
-        })?;
-        let sink = gst::ElementFactory::make("filesink")
-            .property("location", path.to_string_lossy().as_ref())
-            .property("sync", false)
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let video_chain: Vec<gst::Element> = vec![
-            video_src.clone().upcast(),
-            queue,
-            convert,
-            format,
-            encoder,
-            profile,
-            parser,
-            video_out.clone(),
-        ];
-        pipeline
-            .add_many(&video_chain)
-            .and_then(|_| pipeline.add_many([&mux, &sink]))
-            .map_err(|e| e.to_string())?;
-        gst::Element::link_many(&video_chain).map_err(|e| format!("video: {e}"))?;
+        let (mux, _sink) = add_mux(&pipeline, opts.container, &path)?;
+        let (video_src, video_out) = add_video_encoder(&pipeline, &opts, &video_caps)?;
         video_out
             .link(&mux)
             .map_err(|e| format!("video → mux: {e}"))?;
-        mux.link(&sink).map_err(|e| e.to_string())?;
-
-        // ── Audio ──
         let audio_src = if with_audio {
-            let src = gst_app::AppSrc::builder()
-                .caps(&AUDIO_CAPS.parse::<gst::Caps>().expect("valid caps"))
-                .format(gst::Format::Time)
-                .build();
-            let encoder = match opts.container {
-                // AAC is what MP4 players expect; Opus is better and standard in Matroska.
-                Container::Mp4 if gst::ElementFactory::find("avenc_aac").is_some() => {
-                    gst::ElementFactory::make("avenc_aac")
-                        .property("bitrate", 192_000i32)
-                        .build()
-                        .map_err(|e| e.to_string())?
-                }
-                _ => gst::ElementFactory::make("opusenc")
-                    .property("bitrate", 192_000i32)
-                    .build()
-                    .map_err(|e| e.to_string())?,
-            };
-            let chain: Vec<gst::Element> = vec![
-                src.clone().upcast(),
-                make("queue")?,
-                make("audioconvert")?,
-                make("audioresample")?,
-                encoder,
-                make("queue")?,
-            ];
-            pipeline.add_many(&chain).map_err(|e| e.to_string())?;
-            gst::Element::link_many(&chain).map_err(|e| format!("audio: {e}"))?;
-            chain
-                .last()
-                .expect("non-empty")
-                .link(&mux)
-                .map_err(|e| format!("audio → mux: {e}"))?;
+            let (src, out) = add_audio_encoder(&pipeline, opts.container)?;
+            out.link(&mux).map_err(|e| format!("audio → mux: {e}"))?;
             Some(src)
         } else {
             None
@@ -334,26 +288,16 @@ impl Recording {
                 let pipeline = pipeline.clone();
                 let path = path.clone();
                 let stop = Arc::clone(&stop);
-                move || {
-                    use gst::MessageView;
-                    while !stop.load(Ordering::Relaxed) {
-                        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
-                            continue;
-                        };
-                        match msg.view() {
-                            MessageView::Eos(_) => {
-                                let _ = pipeline.set_state(gst::State::Null);
-                                on_event(RecordEvent::Saved(path));
-                                return;
-                            }
-                            MessageView::Error(err) => {
-                                let _ = pipeline.set_state(gst::State::Null);
-                                on_event(RecordEvent::Error(err.error().to_string()));
-                                return;
-                            }
-                            _ => {}
-                        }
+                move || match wait_for_eos(&bus, &stop) {
+                    Some(Ok(())) => {
+                        let _ = pipeline.set_state(gst::State::Null);
+                        on_event(RecordEvent::Saved(path));
                     }
+                    Some(Err(msg)) => {
+                        let _ = pipeline.set_state(gst::State::Null);
+                        on_event(RecordEvent::Error(msg));
+                    }
+                    None => {}
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -362,13 +306,8 @@ impl Recording {
             .set_state(gst::State::Playing)
             .map_err(|_| "The recorder could not start".to_string())?;
 
-        let feed = Arc::new(Feed {
-            video: video_src,
-            audio: audio_src,
-            video_caps,
-            t0: gst::SystemClock::obtain().time(),
-        });
-        tap.set(Some(Arc::clone(&feed)));
+        let feed = Feed::new(video_src, audio_src, video_caps);
+        tap.add(Arc::clone(&feed));
         Ok(Self {
             feed,
             tap,
@@ -380,24 +319,173 @@ impl Recording {
 
     /// Stop feeding and close the file. Returns at once; `Saved` follows when it's written.
     pub fn finish(&self) {
-        self.tap.set(None);
-        let _ = self.feed.video.end_of_stream();
-        if let Some(audio) = &self.feed.audio {
-            let _ = audio.end_of_stream();
-        }
+        self.tap.remove(&self.feed);
+        self.feed.end();
     }
 }
 
 impl Drop for Recording {
     fn drop(&mut self) {
-        self.tap.set(None);
+        self.tap.remove(&self.feed);
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
 
+/// Block until the pipeline finishes (`Ok`), fails (`Err`), or `stop` is set (`None`).
+pub(crate) fn wait_for_eos(bus: &gst::Bus, stop: &AtomicBool) -> Option<Result<(), String>> {
+    use gst::MessageView;
+    while !stop.load(Ordering::Relaxed) {
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
+            continue;
+        };
+        match msg.view() {
+            MessageView::Eos(_) => return Some(Ok(())),
+            MessageView::Error(err) => return Some(Err(err.error().to_string())),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn make(factory: &str) -> Result<gst::Element, String> {
+    gst::ElementFactory::make(factory)
+        .build()
+        .map_err(|_| format!("GStreamer element '{factory}' is missing"))
+}
+
+/// `mux ! filesink` writing to `path`.
+pub(crate) fn add_mux(
+    pipeline: &gst::Pipeline,
+    container: Container,
+    path: &std::path::Path,
+) -> Result<(gst::Element, gst::Element), String> {
+    let mux = make(match container {
+        Container::Mkv => "matroskamux",
+        Container::Mp4 => "mp4mux",
+    })?;
+    let sink = gst::ElementFactory::make("filesink")
+        .property("location", path.to_string_lossy().as_ref())
+        .property("sync", false)
+        .build()
+        .map_err(|e| e.to_string())?;
+    pipeline
+        .add_many([&mux, &sink])
+        .map_err(|e| e.to_string())?;
+    mux.link(&sink).map_err(|e| e.to_string())?;
+    Ok((mux, sink))
+}
+
+/// Raw frames in, an encoded, mux-ready stream out:
+/// `appsrc ! queue ! videoconvert ! capsfilter ! encoder ! capsfilter ! parser ! capsfilter ! queue`.
+/// Returns the appsrc and the last element, for the caller to link onward.
+pub(crate) fn add_video_encoder(
+    pipeline: &gst::Pipeline,
+    opts: &Options,
+    raw_caps: &gst::Caps,
+) -> Result<(gst_app::AppSrc, gst::Element), String> {
+    let src = gst_app::AppSrc::builder()
+        .caps(raw_caps)
+        .format(gst::Format::Time)
+        .build();
+    // If the encoder falls behind, drop frames rather than pile up raw ones in memory
+    // (a second of 1080p RGB is ~370 MB).
+    src.set_property("max-buffers", 30u64);
+    if src.find_property("leaky-type").is_some() {
+        src.set_property_from_str("leaky-type", "downstream");
+    }
+    let queue = gst::ElementFactory::make("queue")
+        .property("max-size-buffers", 0u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 2_000_000_000u64)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let convert = gst::ElementFactory::make("videoconvert")
+        .property("n-threads", 4u32)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let chroma_444 = opts.chroma_444 && opts.encoder.supports_444();
+    let format = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", if chroma_444 { "Y444" } else { "NV12" })
+                .build(),
+        )
+        .build()
+        .map_err(|e| e.to_string())?;
+    let encoder = make(opts.encoder.factory())?;
+    configure_encoder(&encoder, opts);
+    let profile = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            opts.encoder
+                .profile(chroma_444)
+                .unwrap_or_else(gst::Caps::new_any),
+        )
+        .build()
+        .map_err(|e| e.to_string())?;
+    let parser = make(opts.encoder.parser())?;
+    let output = gst::ElementFactory::make("capsfilter")
+        .property("caps", opts.encoder.output_caps())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let out = make("queue")?;
+
+    let chain: Vec<gst::Element> = vec![
+        src.clone().upcast(),
+        queue,
+        convert,
+        format,
+        encoder,
+        profile,
+        parser,
+        output,
+        out.clone(),
+    ];
+    pipeline.add_many(&chain).map_err(|e| e.to_string())?;
+    gst::Element::link_many(&chain).map_err(|e| format!("video: {e}"))?;
+    Ok((src, out))
+}
+
+/// Captured audio in, encoded audio out: Opus for MKV, AAC for MP4.
+pub(crate) fn add_audio_encoder(
+    pipeline: &gst::Pipeline,
+    container: Container,
+) -> Result<(gst_app::AppSrc, gst::Element), String> {
+    let src = gst_app::AppSrc::builder()
+        .caps(&AUDIO_CAPS.parse::<gst::Caps>().expect("valid caps"))
+        .format(gst::Format::Time)
+        .build();
+    let encoder = match container {
+        // AAC is what MP4 players expect; Opus is better and standard in Matroska.
+        Container::Mp4 if gst::ElementFactory::find("avenc_aac").is_some() => {
+            gst::ElementFactory::make("avenc_aac")
+                .property("bitrate", 192_000i32)
+                .build()
+                .map_err(|e| e.to_string())?
+        }
+        _ => gst::ElementFactory::make("opusenc")
+            .property("bitrate", 192_000i32)
+            .build()
+            .map_err(|e| e.to_string())?,
+    };
+    let out = make("queue")?;
+    let chain: Vec<gst::Element> = vec![
+        src.clone().upcast(),
+        make("queue")?,
+        make("audioconvert")?,
+        make("audioresample")?,
+        encoder,
+        out.clone(),
+    ];
+    pipeline.add_many(&chain).map_err(|e| e.to_string())?;
+    gst::Element::link_many(&chain).map_err(|e| format!("audio: {e}"))?;
+    Ok((src, out))
+}
+
 fn configure_encoder(encoder: &gst::Element, opts: &Options) {
-    let gop = (opts.fps.max(1.0) * 2.0).round() as i32;
+    let gop = (opts.fps.max(1.0) * opts.keyframe_seconds.max(0.25)).round() as i32;
     let set_str = |name: &str, value: &str| {
         if encoder.find_property(name).is_some() {
             encoder.set_property_from_str(name, value);
@@ -407,6 +495,7 @@ fn configure_encoder(encoder: &gst::Element, opts: &Options) {
         Encoder::X264 => {
             encoder.set_property("bitrate", opts.bitrate_kbps);
             encoder.set_property("key-int-max", gop as u32);
+            encoder.set_property("bframes", 0u32);
             set_str("speed-preset", "veryfast");
         }
         _ => {
@@ -415,6 +504,11 @@ fn configure_encoder(encoder: &gst::Element, opts: &Options) {
             set_str("rc-mode", "vbr");
             set_str("preset", "p4");
             set_str("tune", "high-quality");
+            // No B-frames: every buffer's decode order is its display order, so stored packets
+            // can be cut at any keyframe and re-timed without DTS bookkeeping.
+            if encoder.find_property("bframes").is_some() {
+                encoder.set_property("bframes", 0u32);
+            }
         }
     }
 }

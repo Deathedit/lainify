@@ -1,6 +1,6 @@
 # lainify
 
-A clean, low-latency desktop viewer for capture cards. It opens the card in its real formats, including uncompressed RGB 4:4:4, plays its audio, takes lossless screenshots and records with the GPU encoder, in 4:4:4 if you want.
+A clean, low-latency desktop viewer for capture cards. It opens the card in its real formats, including uncompressed RGB 4:4:4, plays its audio, takes lossless screenshots, records with the GPU encoder (in 4:4:4 if you want) and can keep a replay buffer of the last minutes of gameplay.
 
 Built with Rust, Qt 6 / QML (through [cxx-qt](https://github.com/KDAB/cxx-qt)) and GStreamer. Linux only.
 
@@ -48,6 +48,7 @@ Run `v4l2-ctl --list-formats-ext -d /dev/video0` to see the modes your card real
 - Audio follows the video device ("Match video device") or any input you pick, with volume up to 150%, mute and a level meter.
 - Screenshots are lossless PNGs in `~/Pictures/lainify`.
 - Recordings go to `~/Videos/lainify`. Pick the encoder (NVENC H.264, HEVC or AV1 when there's an NVIDIA GPU, otherwise x264), bitrate, 4:2:0 or 4:4:4 colour (H.264/HEVC) and MKV or MP4. MKV stays playable if lainify crashes mid-recording; 4:4:4 files play in mpv and VLC but not in browsers or most editors.
+- The replay buffer (off by default; turn it on under Settings → Replay buffer) keeps the last 30 s to 5 min of gameplay encoded in memory. Press <kbd>C</kbd> or the clip button to save it to `~/Videos/lainify/clips`, instantly and without interrupting anything, even while recording. It uses the Recording encoder, colour and file format with its own bitrate. A minute at 20 Mbps takes about 150 MB of RAM. Clips start on a keyframe (one per second), so they can be up to a second longer than the length you picked. Changing the capture mode or the buffer's settings empties it.
 - Every choice is remembered in `~/.config/lainify/lainify.conf`.
 
 | Key                          | Action                 |
@@ -57,6 +58,7 @@ Run `v4l2-ctl --list-formats-ext -d /dev/video0` to see the modes your card real
 | <kbd>↑</kbd> <kbd>↓</kbd>    | Volume                 |
 | <kbd>S</kbd>                 | Screenshot             |
 | <kbd>R</kbd>                 | Start / stop recording |
+| <kbd>C</kbd>                 | Save replay clip       |
 | <kbd>,</kbd>                 | Settings               |
 | <kbd>Esc</kbd>               | Close panel / leave fullscreen |
 
@@ -68,12 +70,15 @@ audio:  device ! audioconvert ! audioresample ! tee ─┬→ level ! volume ! p
                                                      └→ appsink
 record: appsrc (video) ! videoconvert ! encoder ! parser ─┬→ mux ! filesink
         appsrc (audio) ! opusenc | avenc_aac ─────────────┘
+replay: same encoders → appsink → ring of keyframe groups in memory
+        on save: appsrc ×2 → mux ! filesink (no re-encode)
 ```
 
 - `src/devices.rs` lists devices and their exact modes through GStreamer's device monitor, and keeps watching it for hot-plug.
 - `src/video.rs` builds the capture pipeline for the chosen mode. `videoconvert` passes through every format Qt can draw and only converts the rest (24-bit BGR → BGRx, losslessly), so colour detail is never reduced. UVC cards send RGB bottom-up, so RGB frames go through `videoflip`.
 - `src/audio.rs` plays the audio input and reports peak levels.
 - `src/recorder.rs` runs recording as its own pipeline, fed with the frames and samples the viewer already has, so starting or stopping a recording never interrupts the picture. Stopping sends end-of-stream so the file is finalised properly.
+- `src/replay.rs` is the replay buffer. It stores encoded buffers grouped by keyframe and drops whole groups from the front once the rest still covers the length, so it always starts on a keyframe. Timestamps are stored as running time, because encoders shift theirs by 1000 hours and the audio encoder doesn't.
 - `cpp/frame_sink.*` copies each frame once into a `QVideoFrame` for the QML `VideoOutput`, keeping only the newest so a busy UI drops frames instead of lagging. It's the only hand-written C++, because cxx-qt-lib has no Qt Multimedia bindings.
 - `src/bridge/capture.rs` is the `Capture` object QML talks to. `qml/` is the UI, a port of the browser version's design: `Main.qml` wires it together, `components/` holds the small building blocks, and icons are [Lucide](https://lucide.dev) (ISC) with the Inter font (OFL), both in `assets/`.
 

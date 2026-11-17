@@ -16,7 +16,7 @@ pub mod qobject {
         #[qproperty(QString, devices_json, cxx_name = "devicesJson")]
         /// JSON array of audio input names.
         #[qproperty(QString, audio_devices_json, cxx_name = "audioDevicesJson")]
-        /// JSON: `[{ id, label, supports444 }]`, the encoders this machine has.
+        /// JSON: `[{ id, label, supports444, hardware }]`, the encoders this machine has.
         #[qproperty(QString, encoders_json, cxx_name = "encodersJson")]
         /// True once the first device list has arrived.
         #[qproperty(bool, ready)]
@@ -48,6 +48,14 @@ pub mod qobject {
         #[qproperty(f64, record_seconds, cxx_name = "recordSeconds")]
         #[qproperty(QString, screenshot_dir, cxx_name = "screenshotDir")]
         #[qproperty(QString, recording_dir, cxx_name = "recordingDir")]
+        // ── Replay buffer ──
+        /// The buffer is running (enabled and capturing).
+        #[qproperty(bool, replay_active, cxx_name = "replayActive")]
+        /// Seconds of gameplay currently held.
+        #[qproperty(f64, replay_buffered, cxx_name = "replayBuffered")]
+        /// A clip is being written.
+        #[qproperty(bool, clip_saving, cxx_name = "clipSaving")]
+        #[qproperty(QString, clips_dir, cxx_name = "clipsDir")]
         type Capture = super::CaptureRust;
     }
 
@@ -102,7 +110,26 @@ pub mod qobject {
         #[cxx_name = "stopRecording"]
         fn stop_recording(self: Pin<&mut Capture>);
 
-        /// Call about once a second to update `fps` and `recordSeconds`.
+        /// Turn the replay buffer on or off and set what it keeps. It runs whenever capture is
+        /// live and `enabled` is set; changing anything restarts it (emptying the buffer).
+        #[qinvokable]
+        #[cxx_name = "configureReplay"]
+        fn configure_replay(
+            self: Pin<&mut Capture>,
+            enabled: bool,
+            seconds: i32,
+            encoder: &QString,
+            bitrate_kbps: i32,
+            chroma_444: bool,
+            container: &QString,
+        );
+
+        /// Save the replay buffer as a clip.
+        #[qinvokable]
+        #[cxx_name = "saveClip"]
+        fn save_clip(self: Pin<&mut Capture>);
+
+        /// Call about once a second to update `fps`, `recordSeconds` and `replayBuffered`.
         #[qinvokable]
         fn tick(self: Pin<&mut Capture>);
 
@@ -125,6 +152,7 @@ use serde::Serialize;
 use crate::audio::{AudioCapture, AudioEvent};
 use crate::devices::{self, Snapshot};
 use crate::recorder::{Container, Encoder, Options, RecordEvent, Recording, Tap};
+use crate::replay::Replay;
 use crate::video::{self, Event, Selection};
 
 #[derive(Default)]
@@ -151,6 +179,10 @@ pub struct CaptureRust {
     record_seconds: f64,
     screenshot_dir: QString,
     recording_dir: QString,
+    replay_active: bool,
+    replay_buffered: f64,
+    clip_saving: bool,
+    clips_dir: QString,
 
     video_devices: Vec<gst::Device>,
     video_names: Vec<String>,
@@ -174,6 +206,20 @@ pub struct CaptureRust {
     tap: Tap,
     record: Option<Recording>,
     record_started: Option<Instant>,
+
+    /// `None` while the replay buffer is turned off.
+    replay_config: Option<ReplayConfig>,
+    replay: Option<Replay>,
+    replay_generation: u64,
+}
+
+#[derive(Clone, PartialEq)]
+struct ReplayConfig {
+    seconds: u32,
+    encoder: String,
+    bitrate_kbps: i32,
+    chroma_444: bool,
+    container: String,
 }
 
 #[derive(Serialize)]
@@ -182,6 +228,7 @@ struct EncoderInfo {
     label: &'static str,
     #[serde(rename = "supports444")]
     supports_444: bool,
+    hardware: bool,
 }
 
 impl Initialize for qobject::Capture {
@@ -192,6 +239,7 @@ impl Initialize for qobject::Capture {
                 id: e.id(),
                 label: e.label(),
                 supports_444: e.supports_444(),
+                hardware: e.is_hardware(),
             })
             .collect();
         let json = serde_json::to_string(&encoders).unwrap_or_else(|_| "[]".into());
@@ -203,6 +251,9 @@ impl Initialize for qobject::Capture {
         ));
         self.as_mut().set_recording_dir(QString::from(
             &crate::paths::recordings_dir().display().to_string(),
+        ));
+        self.as_mut().set_clips_dir(QString::from(
+            &crate::paths::clips_dir().display().to_string(),
         ));
         {
             let mut rust = self.as_mut().rust_mut();
@@ -328,6 +379,7 @@ impl qobject::Capture {
                         this.as_mut().set_video_height(mode.height);
                         this.as_mut().rust_mut().source_fps = mode.fps;
                         this.as_mut().set_status(QString::from("live"));
+                        this.as_mut().ensure_replay();
                     }
                     Event::Error(msg) => {
                         eprintln!("lainify: capture error: {msg}");
@@ -358,6 +410,7 @@ impl qobject::Capture {
         if self.rust().record.is_some() && self.rust().recording {
             self.as_mut().stop_recording();
         }
+        self.as_mut().stop_replay();
         {
             let mut rust = self.as_mut().rust_mut();
             rust.generation += 1;
@@ -521,11 +574,7 @@ impl qobject::Capture {
             self.as_mut().notify("Nothing to record yet", "error");
             return;
         };
-        let available = Encoder::available();
-        let encoder = Encoder::from_id(&encoder.to_string())
-            .filter(|e| available.contains(e))
-            .or_else(|| available.first().copied());
-        let Some(encoder) = encoder else {
+        let Some(encoder) = pick_encoder(&encoder.to_string()) else {
             self.as_mut()
                 .notify("No video encoder is available", "error");
             return;
@@ -537,6 +586,7 @@ impl qobject::Capture {
             chroma_444,
             container: Container::from_id(&container.to_string()),
             fps: self.rust().source_fps,
+            keyframe_seconds: 2.0,
         };
         let with_audio = self.rust().audio.is_some();
         let qt = self.qt_thread();
@@ -595,6 +645,142 @@ impl qobject::Capture {
         self.as_mut().set_saving(true);
     }
 
+    // ── Replay buffer ────────────────────────────────────────────────────────
+
+    pub fn configure_replay(
+        mut self: Pin<&mut Self>,
+        enabled: bool,
+        seconds: i32,
+        encoder: &QString,
+        bitrate_kbps: i32,
+        chroma_444: bool,
+        container: &QString,
+    ) {
+        let config = enabled.then(|| ReplayConfig {
+            seconds: seconds.clamp(5, 600) as u32,
+            encoder: encoder.to_string(),
+            bitrate_kbps: bitrate_kbps.clamp(1_000, 400_000),
+            chroma_444,
+            container: container.to_string(),
+        });
+        if config == self.rust().replay_config {
+            return;
+        }
+        self.as_mut().rust_mut().replay_config = config;
+        self.as_mut().stop_replay();
+        self.as_mut().ensure_replay();
+    }
+
+    /// Start the buffer if it's wanted, capture is live and the first frame has arrived.
+    /// Called on going live, on configuration changes, and every tick (to catch the first frame).
+    fn ensure_replay(mut self: Pin<&mut Self>) {
+        if self.rust().replay.is_some() || self.rust().status.to_string() != "live" {
+            return;
+        }
+        let Some(config) = self.rust().replay_config.clone() else {
+            return;
+        };
+        let Some(caps) = self
+            .rust()
+            .video
+            .as_ref()
+            .and_then(|c| c.last_sample())
+            .and_then(|s| s.caps_owned())
+        else {
+            return;
+        };
+        let Some(encoder) = pick_encoder(&config.encoder) else {
+            return;
+        };
+        let opts = Options {
+            encoder,
+            bitrate_kbps: config.bitrate_kbps as u32,
+            chroma_444: config.chroma_444,
+            container: Container::from_id(&config.container),
+            fps: self.rust().source_fps,
+            // Clips start on a keyframe, so this is how much longer than asked a clip can be.
+            keyframe_seconds: 1.0,
+        };
+        let generation = self.rust().replay_generation;
+        let qt = self.qt_thread();
+        let tap = self.rust().tap.clone();
+        let started = Replay::start(opts, config.seconds, caps, tap, move |msg| {
+            let _ = qt.queue(move |mut this: Pin<&mut qobject::Capture>| {
+                if this.rust().replay_generation != generation {
+                    return;
+                }
+                eprintln!("lainify: replay buffer error: {msg}");
+                this.as_mut().stop_replay();
+                this.notify(&format!("Replay buffer stopped: {msg}"), "error");
+            });
+        });
+        match started {
+            Ok(replay) => {
+                eprintln!(
+                    "lainify: replay buffer on, last {} s with {}",
+                    config.seconds,
+                    encoder.id()
+                );
+                self.as_mut().rust_mut().replay = Some(replay);
+                self.as_mut().set_replay_buffered(0.0);
+                self.as_mut().set_replay_active(true);
+            }
+            Err(msg) => {
+                eprintln!("lainify: replay buffer failed: {msg}");
+                // Don't retry every tick with a setup that can't work.
+                self.as_mut().rust_mut().replay_config = None;
+                self.as_mut()
+                    .notify(&format!("Replay buffer could not start: {msg}"), "error");
+            }
+        }
+    }
+
+    fn stop_replay(mut self: Pin<&mut Self>) {
+        {
+            let mut rust = self.as_mut().rust_mut();
+            rust.replay_generation += 1;
+            rust.replay = None;
+        }
+        self.as_mut().set_replay_active(false);
+        self.as_mut().set_replay_buffered(0.0);
+    }
+
+    pub fn save_clip(mut self: Pin<&mut Self>) {
+        if self.rust().clip_saving {
+            return;
+        }
+        let qt = self.qt_thread();
+        let saved = match &self.rust().replay {
+            None => Err("Replay buffer is off — turn it on in Settings".to_string()),
+            Some(replay) => replay.save(move |result| {
+                let _ = qt.queue(move |mut this: Pin<&mut qobject::Capture>| {
+                    this.as_mut().set_clip_saving(false);
+                    match result {
+                        Ok((path, seconds)) => {
+                            eprintln!("lainify: saved clip {}", path.display());
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            this.notify(
+                                &format!("Saved last {} s — {name}", seconds.round()),
+                                "success",
+                            );
+                        }
+                        Err(msg) => {
+                            eprintln!("lainify: clip failed: {msg}");
+                            this.notify(&format!("Clip failed: {msg}"), "error");
+                        }
+                    }
+                });
+            }),
+        };
+        match saved {
+            Ok(()) => self.as_mut().set_clip_saving(true),
+            Err(msg) => self.as_mut().notify(&msg, "info"),
+        }
+    }
+
     // ── Housekeeping ─────────────────────────────────────────────────────────
 
     pub fn tick(mut self: Pin<&mut Self>) {
@@ -629,11 +815,24 @@ impl qobject::Capture {
         {
             self.as_mut().set_record_seconds(seconds);
         }
+        self.as_mut().ensure_replay();
+        let buffered = self.rust().replay.as_ref().map(|r| r.buffered_seconds());
+        if let Some(buffered) = buffered {
+            self.as_mut().set_replay_buffered(buffered);
+        }
     }
 
     fn notify(self: Pin<&mut Self>, text: &str, tone: &str) {
         self.notice(QString::from(text), QString::from(tone));
     }
+}
+
+/// The encoder with this id if the machine has it, else the first one it has.
+fn pick_encoder(id: &str) -> Option<Encoder> {
+    let available = Encoder::available();
+    Encoder::from_id(id)
+        .filter(|e| available.contains(e))
+        .or_else(|| available.first().copied())
 }
 
 /// The audio input that belongs to the video device, e.g. `Elgato 4K X Analog Stereo` for

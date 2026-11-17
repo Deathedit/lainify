@@ -41,6 +41,9 @@ ApplicationWindow {
         property bool chroma444: false
         property string container: "mkv"
         property int hideDelay: 2500
+        property bool replayEnabled: false
+        property int replaySeconds: 60
+        property int replayBitrate: 20000
     }
 
     // ── Devices and the current selection ────────────────────────────────────
@@ -156,6 +159,18 @@ ApplicationWindow {
         else if (live && !capture.saving && encoder)
             capture.startRecording(encoder.id, prefs.bitrate, prefs.chroma444, prefs.container);
     }
+    function saveClip() {
+        if (!prefs.replayEnabled)
+            toasts.show("Replay buffer is off — turn it on in Settings", "info");
+        else if (live)
+            capture.saveClip();
+    }
+    // The replay buffer shares the recording's encoder, colour and file format.
+    readonly property var replayConfig: [prefs.replayEnabled, prefs.replaySeconds, encoder ? encoder.id : "", prefs.replayBitrate, prefs.chroma444, prefs.container]
+    onReplayConfigChanged: Qt.callLater(syncReplay)
+    function syncReplay() {
+        capture.configureReplay(prefs.replayEnabled, prefs.replaySeconds, encoder ? encoder.id : "", prefs.replayBitrate, prefs.chroma444, prefs.container);
+    }
     function toggleFullscreen() {
         win.visibility = fullscreen ? Window.Windowed : Window.FullScreen;
     }
@@ -179,7 +194,7 @@ ApplicationWindow {
     Timer {
         interval: 1000
         repeat: true
-        running: win.running || capture.recording
+        running: win.running || capture.recording || capture.replayActive
         onTriggered: capture.tick()
     }
 
@@ -252,6 +267,9 @@ ApplicationWindow {
             live: win.live
             recording: capture.recording
             elapsed: capture.recordSeconds
+            replay: capture.replayActive
+            replayBuffered: capture.replayBuffered
+            replayLength: prefs.replaySeconds
             deviceName: capture.deviceName
             details: {
                 const parts = [];
@@ -280,6 +298,12 @@ ApplicationWindow {
             recording: capture.recording
             saving: capture.saving
             elapsed: capture.recordSeconds
+            replayOn: prefs.replayEnabled
+            replayActive: capture.replayActive
+            replayBuffered: capture.replayBuffered
+            replayLength: prefs.replaySeconds
+            clipSaving: capture.clipSaving
+            onClip: win.saveClip()
             fullscreen: win.fullscreen
             panelOpen: win.panelOpen
             onPower: win.running ? win.stopCapture() : win.startCapture()
@@ -441,8 +465,45 @@ ApplicationWindow {
                 win.poke();
             }
 
+            replayOptions: [
+                {
+                    "value": "off",
+                    "label": "Off"
+                },
+                {
+                    "value": "on",
+                    "label": "On — press C to save a clip"
+                }
+            ]
+            replayValue: prefs.replayEnabled ? "on" : "off"
+            onReplayChanged: v => prefs.replayEnabled = v === "on"
+            replayLengthOptions: [30, 60, 120, 300].map(n => ({
+                        "value": String(n),
+                        "label": n < 60 ? `Last ${n} seconds` : n === 60 ? "Last minute" : `Last ${n / 60} minutes`
+                    }))
+            replayLengthValue: String(prefs.replaySeconds)
+            onReplayLengthChanged: v => prefs.replaySeconds = Number(v)
+            replayBitrateOptions: [12, 20, 40, 80].map(m => ({
+                        "value": String(m * 1000),
+                        "label": `${m} Mbps${m === recommended ? " (recommended)" : ""}`
+                    }))
+            replayBitrateValue: String(prefs.replayBitrate)
+            onReplayBitrateChanged: v => prefs.replayBitrate = Number(v)
+            replayHint: {
+                if (!prefs.replayEnabled)
+                    return "Keeps the last moments of gameplay in memory, so you can save a clip after something happens.";
+                const mb = Math.round(prefs.replayBitrate * prefs.replaySeconds / 8 / 1000 * 1.05);
+                const parts = [`Uses about ${mb >= 1000 ? (mb / 1000).toFixed(1) + " GB" : mb + " MB"} of memory. Encoder, colour and file format follow Recording.`];
+                if (win.encoder && !win.encoder.hardware)
+                    parts.push("x264 encodes on the CPU the whole time the buffer is on.");
+                if (capture.replayActive)
+                    parts.push(`Holding ${Theme.duration(Math.min(capture.replayBuffered, prefs.replaySeconds))}.`);
+                return parts.join(" ");
+            }
+
             screenshotDir: capture.screenshotDir
             recordingDir: capture.recordingDir
+            clipsDir: capture.clipsDir
         }
 
         Toasts {
@@ -478,6 +539,10 @@ ApplicationWindow {
     Shortcut {
         sequence: "R"
         onActivated: win.toggleRecording()
+    }
+    Shortcut {
+        sequence: "C"
+        onActivated: win.saveClip()
     }
     Shortcut {
         sequence: ","

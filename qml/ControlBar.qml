@@ -15,6 +15,12 @@ Item {
     property real levelRight: 0
     property bool recording: false
     property bool saving: false
+    /// The replay buffer is turned on in settings (the clip button only shows then).
+    property bool replayOn: false
+    property bool replayActive: false
+    property real replayBuffered: 0
+    property int replayLength: 60
+    property bool clipSaving: false
     property real elapsed: 0
     property bool fullscreen: false
     property bool panelOpen: false
@@ -22,6 +28,7 @@ Item {
 
     signal power
     signal screenshot
+    signal clip
     signal record
     signal settings
     signal toggleFullscreen
@@ -140,6 +147,46 @@ Item {
                 iconName: "camera"
                 enabled: bar.live
                 onClicked: bar.screenshot()
+            }
+
+            IconButton {
+                id: clipButton
+
+                readonly property bool full: bar.replayBuffered >= bar.replayLength - 0.5
+
+                visible: bar.replayOn
+                label: bar.clipSaving ? "Saving clip…"
+                    : full ? `Save last ${Theme.duration(bar.replayLength)}`
+                    : `Save clip (${Theme.duration(bar.replayBuffered)} so far)`
+                shortcut: "C"
+                iconName: "history"
+                enabled: bar.replayActive && bar.replayBuffered >= 1 && !bar.clipSaving
+                onClicked: bar.clip()
+
+                // Fill indicator: a thin bar under the icon while the buffer builds up.
+                Rectangle {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 5
+                    visible: bar.replayActive && !clipButton.full
+                    width: 16
+                    height: 2
+                    radius: 1
+                    color: Theme.white(0.15)
+                    Rectangle {
+                        width: parent.width * Math.min(1, bar.replayBuffered / Math.max(1, bar.replayLength))
+                        height: parent.height
+                        radius: 1
+                        color: Theme.accent400
+                    }
+                }
+                Spinner {
+                    anchors.centerIn: parent
+                    visible: bar.clipSaving
+                    size: 18
+                    color: Theme.zinc300
+                }
+                iconColor: bar.clipSaving ? "transparent" : (hovered ? "white" : Theme.zinc300)
             }
 
             IconButton {

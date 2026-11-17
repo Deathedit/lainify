@@ -25,3 +25,7 @@ pub fn timestamp() -> String {
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "capture".into())
 }
+
+pub fn clips_dir() -> PathBuf {
+    recordings_dir().join("clips")
+}

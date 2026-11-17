@@ -6,6 +6,7 @@ mod bridge;
 mod devices;
 mod paths;
 mod recorder;
+mod replay;
 mod video;
 
 use std::sync::Arc;

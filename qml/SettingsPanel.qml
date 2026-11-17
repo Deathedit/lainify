@@ -18,6 +18,9 @@ Item {
     property var chromaOptions: []
     property var containerOptions: []
     property var hideOptions: []
+    property var replayOptions: []
+    property var replayLengthOptions: []
+    property var replayBitrateOptions: []
 
     property string videoValue
     property string formatValue
@@ -29,6 +32,10 @@ Item {
     property string chromaValue
     property string containerValue
     property string hideValue
+    property string replayValue
+    property string replayLengthValue
+    property string replayBitrateValue
+    property string replayHint
 
     /// Mode and recording settings are locked while recording.
     property bool recording: false
@@ -37,6 +44,7 @@ Item {
     property string audioInfo
     property string screenshotDir
     property string recordingDir
+    property string clipsDir
 
     signal closeRequested
     signal videoChanged(string value)
@@ -49,6 +57,9 @@ Item {
     signal chromaChanged(string value)
     signal containerChanged(string value)
     signal hideChanged(string value)
+    signal replayChanged(string value)
+    signal replayLengthChanged(string value)
+    signal replayBitrateChanged(string value)
 
     anchors.fill: parent
     visible: open || panel.opacity > 0
@@ -73,6 +84,10 @@ Item {
         {
             "keys": ["R"],
             "label": "Start / stop recording"
+        },
+        {
+            "keys": ["C"],
+            "label": "Save replay clip"
         },
         {
             "keys": [","],
@@ -356,6 +371,39 @@ Item {
                     }
                 }
 
+                // ── Replay buffer ──
+                Column {
+                    width: parent.width
+                    spacing: 12
+                    Heading {
+                        text: "Replay buffer"
+                        iconName: "history"
+                    }
+                    Select {
+                        label: "Keep recent gameplay"
+                        options: settings.replayOptions
+                        value: settings.replayValue
+                        onChanged: v => settings.replayChanged(v)
+                    }
+                    Select {
+                        visible: settings.replayValue === "on"
+                        label: "Clip length"
+                        options: settings.replayLengthOptions
+                        value: settings.replayLengthValue
+                        onChanged: v => settings.replayLengthChanged(v)
+                    }
+                    Select {
+                        visible: settings.replayValue === "on"
+                        label: "Video bitrate"
+                        options: settings.replayBitrateOptions
+                        value: settings.replayBitrateValue
+                        onChanged: v => settings.replayBitrateChanged(v)
+                    }
+                    InfoBox {
+                        text: settings.replayHint
+                    }
+                }
+
                 // ── Files ──
                 Column {
                     width: parent.width
@@ -367,6 +415,10 @@ Item {
                     FolderRow {
                         label: "Recordings"
                         path: settings.recordingDir
+                    }
+                    FolderRow {
+                        label: "Clips"
+                        path: settings.clipsDir
                     }
                     FolderRow {
                         label: "Screenshots"
