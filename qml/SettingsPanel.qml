@@ -42,6 +42,7 @@ Item {
     property bool chromaAvailable: true
     property string videoInfo
     property string audioInfo
+    property string audioWarning
     property string screenshotDir
     property string recordingDir
     property string clipsDir
@@ -150,6 +151,36 @@ Item {
             font.pixelSize: 12
             font.features: Theme.tabular
             color: Theme.zinc400
+        }
+    }
+
+    component WarningBox: Rectangle {
+        property alias text: warningText.text
+        visible: text !== ""
+        width: parent.width
+        height: warningText.implicitHeight + 20
+        radius: 8
+        color: Qt.rgba(Theme.amber400.r, Theme.amber400.g, Theme.amber400.b, 0.08)
+        border.color: Qt.rgba(Theme.amber400.r, Theme.amber400.g, Theme.amber400.b, 0.20)
+        Icon {
+            id: warningIcon
+            x: 10
+            y: 11
+            name: "triangle-alert"
+            size: 14
+            color: Theme.amber300
+        }
+        Text {
+            id: warningText
+            x: 32
+            width: parent.width - 44
+            anchors.verticalCenter: parent.verticalCenter
+            wrapMode: Text.Wrap
+            lineHeight: 1.25
+            font.family: Theme.font
+            font.pixelSize: 12
+            font.features: Theme.tabular
+            color: Theme.zinc200
         }
     }
 
@@ -329,6 +360,9 @@ Item {
                     }
                     InfoBox {
                         text: settings.audioInfo
+                    }
+                    WarningBox {
+                        text: settings.audioWarning
                     }
                 }
 

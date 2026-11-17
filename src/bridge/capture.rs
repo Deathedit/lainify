@@ -41,6 +41,9 @@ pub mod qobject {
         #[qproperty(QString, audio_info, cxx_name = "audioInfo")]
         #[qproperty(f64, level_left, cxx_name = "levelLeft")]
         #[qproperty(f64, level_right, cxx_name = "levelRight")]
+        /// Percent of the input's audio that never arrives (0 when it's intact). Some capture
+        /// cards drop audio in heavy video modes, which is heard as crackling.
+        #[qproperty(f64, audio_loss, cxx_name = "audioLoss")]
         // ── Recording ──
         #[qproperty(bool, recording)]
         /// Closing the file after a recording stopped.
@@ -174,6 +177,7 @@ pub struct CaptureRust {
     audio_info: QString,
     level_left: f64,
     level_right: f64,
+    audio_loss: f64,
     recording: bool,
     saving: bool,
     record_seconds: f64,
@@ -202,6 +206,8 @@ pub struct CaptureRust {
     audio_choice: String,
     volume: f64,
     muted: bool,
+    /// The audio-loss toast was shown for this capture session.
+    loss_warned: bool,
 
     tap: Tap,
     record: Option<Recording>,
@@ -364,6 +370,7 @@ impl qobject::Capture {
 
         self.as_mut().set_device_name(QString::from(&name));
         self.as_mut().set_status(QString::from("starting"));
+        self.as_mut().rust_mut().loss_warned = false;
         let tap = self.rust().tap.clone();
         let started = video::Capture::start(selection, tap, move |event| {
             let _ = qt.queue(move |mut this: Pin<&mut qobject::Capture>| {
@@ -463,6 +470,7 @@ impl qobject::Capture {
         self.as_mut().set_audio_info(QString::default());
         self.as_mut().set_level_left(0.0);
         self.as_mut().set_level_right(0.0);
+        self.as_mut().set_audio_loss(0.0);
         self.as_mut().set_audio_status(QString::from("none"));
     }
 
@@ -509,6 +517,18 @@ impl qobject::Capture {
                     AudioEvent::Levels(left, right) => {
                         this.as_mut().set_level_left(left);
                         this.as_mut().set_level_right(right);
+                    }
+                    AudioEvent::Rate { ppm, losing } => {
+                        eprintln!("lainify: audio input rate {ppm:+.0} ppm");
+                        let loss = if losing { -ppm / 10_000.0 } else { 0.0 };
+                        this.as_mut().set_audio_loss(loss.max(0.0));
+                        if losing && !this.rust().loss_warned {
+                            this.as_mut().rust_mut().loss_warned = true;
+                            this.notify(
+                                "The capture card is dropping audio in this mode — see Settings",
+                                "error",
+                            );
+                        }
                     }
                     AudioEvent::Error(msg) => {
                         eprintln!("lainify: audio error: {msg}");

@@ -7,9 +7,10 @@
 //! It is its own pipeline so switching inputs never interrupts the picture. Both pipelines use
 //! the system clock, which is what lets the recorder line the two up.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use gstreamer as gst;
 use gstreamer::glib;
@@ -24,11 +25,20 @@ pub const AUDIO_CAPS: &str = "audio/x-raw,format=F32LE,rate=48000,channels=2,lay
 /// Bottom of the meter scale, in dBFS.
 const METER_FLOOR_DB: f64 = -60.0;
 
+/// Name of the bus message the rate meter posts.
+const RATE_MESSAGE: &str = "lainify-audio-rate";
+
 pub enum AudioEvent {
     /// Playing; describes the input, e.g. `48 kHz · stereo`.
     Live(String),
     /// Peak levels for the meter, left and right, each 0…1 on a dBFS scale.
     Levels(f64, f64),
+    /// The input is (or stopped) delivering fewer samples than real time; `ppm` is the latest
+    /// measured shortfall (negative), e.g. -856 for 0.0856% missing.
+    Rate {
+        ppm: f64,
+        losing: bool,
+    },
     Error(String),
 }
 
@@ -56,15 +66,40 @@ impl AudioCapture {
         let src = device
             .create_element(None)
             .map_err(|e| format!("Could not open audio input: {e}"))?;
-        // Small buffers: this is a monitor, not music playback (values in µs).
+        // Small chunks for low latency, but a deep buffer: while lainify is busy with 4K video
+        // and encoding, the input can be read 30-90 ms late, and a short buffer would drop
+        // audio (values in µs).
         set_if_present(&src, "latency-time", 10_000i64);
-        set_if_present(&src, "buffer-time", 40_000i64);
+        set_if_present(&src, "buffer-time", 200_000i64);
 
         let caps = gst::ElementFactory::make("capsfilter")
             .property("caps", AUDIO_CAPS.parse::<gst::Caps>().expect("valid caps"))
             .build()
             .map_err(|e| e.to_string())?;
         let tee = make("tee")?;
+
+        // Count what actually arrives (after conversion: F32 stereo, 8 bytes a frame). Some
+        // capture cards silently drop audio in heavy video modes, which is heard as crackling.
+        let meter = Mutex::new(RateMeter::new(48_000.0));
+        let started = Instant::now();
+        caps.static_pad("src")
+            .expect("capsfilter has a src pad")
+            .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+                if let Some(buffer) = info.buffer() {
+                    let frames = buffer.size() as u64 / 8;
+                    let now = started.elapsed().as_secs_f64();
+                    if let Some(report) = meter.lock().unwrap().observe(now, frames)
+                        && let Some(element) = pad.parent_element()
+                    {
+                        let s = gst::Structure::builder(RATE_MESSAGE)
+                            .field("ppm", report.ppm)
+                            .field("losing", report.losing)
+                            .build();
+                        let _ = element.post_message(gst::message::Element::new(s));
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
 
         let leaky_queue = || {
             gst::ElementFactory::make("queue")
@@ -88,8 +123,10 @@ impl AudioCapture {
             .map_err(|e| e.to_string())?;
         let out = make("pulsesink").or_else(|_| make("autoaudiosink"))?;
         set_if_present(&out, "sync", false);
-        set_if_present(&out, "latency-time", 10_000i64);
-        set_if_present(&out, "buffer-time", 40_000i64);
+        // 100 ms of headroom rides out those late reads; with 40 ms the output ran dry every
+        // few seconds under load, which is heard as crackling.
+        set_if_present(&out, "latency-time", 20_000i64);
+        set_if_present(&out, "buffer-time", 100_000i64);
 
         let appsink = gst_app::AppSink::builder().sync(false).build();
         appsink.set_callbacks(
@@ -196,7 +233,12 @@ fn watch_bus(
         };
         match msg.view() {
             MessageView::Element(el) => {
-                if let Some(s) = el.structure().filter(|s| s.name() == "level") {
+                if let Some(s) = el.structure().filter(|s| s.name() == RATE_MESSAGE) {
+                    on_event(AudioEvent::Rate {
+                        ppm: s.get::<f64>("ppm").unwrap_or(0.0),
+                        losing: s.get::<bool>("losing").unwrap_or(false),
+                    });
+                } else if let Some(s) = el.structure().filter(|s| s.name() == "level") {
                     let peaks = peaks_db(s);
                     let left = peaks.first().copied().unwrap_or(f64::NEG_INFINITY);
                     let right = peaks.get(1).copied().unwrap_or(left);
@@ -217,6 +259,100 @@ fn watch_bus(
             }
             _ => {}
         }
+    }
+}
+
+/// Detects an input that delivers fewer samples than real time.
+///
+/// Arrival times jitter by tens of milliseconds (more while lainify is busy), so a plain count
+/// would need many minutes to be trustworthy. Instead each window fits a straight line through
+/// (arrival time, frames so far); its slope is the delivered rate, and the jitter averages out.
+/// Two bad windows in a row raise the flag, two good ones clear it.
+struct RateMeter {
+    nominal: f64,
+    start: Option<f64>,
+    window: Option<Window>,
+    /// Positive: consecutive bad windows; negative: consecutive good ones.
+    streak: i32,
+    losing: bool,
+}
+
+#[derive(Default)]
+struct Window {
+    t0: f64,
+    frames: f64,
+    n: f64,
+    st: f64,
+    sf: f64,
+    stt: f64,
+    stf: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RateReport {
+    ppm: f64,
+    losing: bool,
+}
+
+impl RateMeter {
+    /// Ignore the start-up, when buffers fill and arrive in bursts.
+    const WARMUP_S: f64 = 5.0;
+    const WINDOW_S: f64 = 20.0;
+    /// Clean inputs measure within ±40 ppm; one dropping audio, hundreds.
+    const LOSS_PPM: f64 = -150.0;
+
+    fn new(nominal: f64) -> Self {
+        Self {
+            nominal,
+            start: None,
+            window: None,
+            streak: 0,
+            losing: false,
+        }
+    }
+
+    /// Record `frames` arriving at `now` (seconds). Returns a report at the end of each window.
+    fn observe(&mut self, now: f64, frames: u64) -> Option<RateReport> {
+        let start = *self.start.get_or_insert(now);
+        if now - start < Self::WARMUP_S {
+            return None;
+        }
+        let w = self.window.get_or_insert_with(|| Window {
+            t0: now,
+            ..Default::default()
+        });
+        w.frames += frames as f64;
+        let t = now - w.t0;
+        w.n += 1.0;
+        w.st += t;
+        w.sf += w.frames;
+        w.stt += t * t;
+        w.stf += t * w.frames;
+        if t < Self::WINDOW_S {
+            return None;
+        }
+
+        let denominator = w.n * w.stt - w.st * w.st;
+        let w = self.window.take().expect("window exists");
+        if denominator <= 0.0 {
+            return None;
+        }
+        let rate = (w.n * w.stf - w.st * w.sf) / denominator;
+        let ppm = (rate / self.nominal - 1.0) * 1e6;
+        if ppm < Self::LOSS_PPM {
+            self.streak = self.streak.max(0) + 1;
+        } else {
+            self.streak = self.streak.min(0) - 1;
+        }
+        if self.streak >= 2 {
+            self.losing = true;
+        } else if self.streak <= -2 {
+            self.losing = false;
+        }
+        Some(RateReport {
+            ppm,
+            losing: self.losing,
+        })
     }
 }
 
@@ -263,7 +399,59 @@ fn describe(src: &gst::Element) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::to_meter;
+    use super::{RateMeter, to_meter};
+
+    /// Feed `seconds` of an input delivering `ppm` off nominal in 10 ms chunks, arriving up to
+    /// `jitter` seconds late (deterministic pseudo-random), with an occasional long stall.
+    fn simulate(ppm: f64, jitter: f64, seconds: f64) -> Vec<(f64, bool)> {
+        let mut meter = RateMeter::new(48_000.0);
+        let rate = 48_000.0 * (1.0 + ppm / 1e6);
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10_000) as f64 / 10_000.0
+        };
+        let (mut produced, mut sent, mut reports) = (0.0f64, 0u64, Vec::new());
+        let mut t = 0.0;
+        while t < seconds {
+            t += 0.01;
+            produced += rate * 0.01;
+            let stall = if random() < 0.005 { 0.09 } else { 0.0 };
+            let arrival = t + random() * jitter + stall;
+            let frames = produced as u64 - sent;
+            sent += frames;
+            if let Some(r) = meter.observe(arrival, frames) {
+                reports.push((r.ppm, r.losing));
+            }
+        }
+        reports
+    }
+
+    #[test]
+    fn rate_meter_flags_a_lossy_input() {
+        let reports = simulate(-856.0, 0.04, 100.0);
+        assert!(reports.len() >= 3);
+        // Each window is within ~100 ppm under heavy jitter, well clear of the threshold.
+        assert!(
+            reports.iter().all(|(ppm, _)| (ppm + 856.0).abs() < 150.0),
+            "{reports:?}"
+        );
+        assert!(!reports[0].1, "one window is not enough");
+        assert!(reports.last().unwrap().1, "flagged after two windows");
+    }
+
+    #[test]
+    fn rate_meter_trusts_a_clean_input() {
+        for ppm in [-40.0, 0.0, 30.0] {
+            let reports = simulate(ppm, 0.04, 200.0);
+            assert!(
+                reports.iter().all(|(_, losing)| !losing),
+                "{ppm}: {reports:?}"
+            );
+        }
+    }
 
     #[test]
     fn meter_scale() {
