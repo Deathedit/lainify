@@ -11,7 +11,8 @@ describe('sanitizeSettings', () => {
 		const s = sanitizeSettings({
 			videoId: 'cam',
 			audioId: 'none',
-			modeId: '1080p60',
+			resolution: 1080,
+			frameRate: 60,
 			volume: 0.4,
 			muted: true,
 			bitrate: 20_000_000,
@@ -21,7 +22,8 @@ describe('sanitizeSettings', () => {
 		expect(s).toEqual({
 			videoId: 'cam',
 			audioId: 'none',
-			modeId: '1080p60',
+			resolution: 1080,
+			frameRate: 60,
 			volume: 0.4,
 			muted: true,
 			bitrate: 20_000_000,
@@ -43,5 +45,23 @@ describe('sanitizeSettings', () => {
 		expect(s.muted).toBe(false);
 		expect(s.recordTarget).toBe('download');
 		expect(s.videoId).toBeNull();
+	});
+
+	it('migrates the old combined mode id', () => {
+		expect(sanitizeSettings({ modeId: '1440p30' })).toMatchObject({
+			resolution: 1440,
+			frameRate: 30
+		});
+		expect(sanitizeSettings({ modeId: 'auto' })).toMatchObject({
+			resolution: null,
+			frameRate: null
+		});
+	});
+
+	it('drops unknown resolutions and frame rates', () => {
+		expect(sanitizeSettings({ resolution: 1234, frameRate: 144 })).toMatchObject({
+			resolution: null,
+			frameRate: null
+		});
 	});
 });

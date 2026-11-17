@@ -1,4 +1,4 @@
-import { FPS_TOLERANCE, type CaptureMode } from './modes';
+import { FPS_TOLERANCE, PREFERRED, type CaptureMode } from './modes';
 
 // Not yet in TypeScript's DOM lib.
 type ExtendedConstraints = MediaTrackConstraints & {
@@ -26,7 +26,7 @@ export function audioConstraints(deviceId: string): MediaTrackConstraints {
 /**
  * `strict` asks for the exact native mode (no browser-side scaling or frame
  * dropping); the relaxed variant is the fallback when the device refuses it.
- * With no mode we ask for 1080p60, the sweet spot for most capture cards.
+ * Axes left on auto prefer 1080p / 60 fps, the sweet spot for most capture cards.
  */
 export function videoConstraints(
 	deviceId: string | undefined,
@@ -36,22 +36,22 @@ export function videoConstraints(
 	const c: ExtendedConstraints = {};
 	if (deviceId) c.deviceId = { exact: deviceId };
 
-	if (!mode) {
-		c.width = { ideal: 1920 };
-		c.height = { ideal: 1080 };
-		c.frameRate = { ideal: 60 };
-		return c;
-	}
+	const resolution = mode?.resolution;
+	const frameRate = mode?.frameRate;
+	const exact = strict && !!mode;
 
-	if (strict) {
-		c.width = { exact: mode.width };
-		c.height = { exact: mode.height };
-		c.frameRate = { min: mode.frameRate * FPS_TOLERANCE, ideal: mode.frameRate };
-		c.resizeMode = 'none';
-	} else {
-		c.width = { ideal: mode.width };
-		c.height = { ideal: mode.height };
-		c.frameRate = { ideal: mode.frameRate };
-	}
+	c.width =
+		resolution && exact
+			? { exact: resolution.width }
+			: { ideal: resolution?.width ?? PREFERRED.width };
+	c.height =
+		resolution && exact
+			? { exact: resolution.height }
+			: { ideal: resolution?.height ?? PREFERRED.height };
+	c.frameRate =
+		frameRate && exact
+			? { min: frameRate * FPS_TOLERANCE, ideal: frameRate }
+			: { ideal: frameRate ?? PREFERRED.frameRate };
+	if (exact) c.resizeMode = 'none';
 	return c;
 }

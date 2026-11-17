@@ -3,7 +3,14 @@
 	import { AudioEngine } from '#lib/audio/engine.svelte.ts';
 	import { DeviceManager } from '#lib/capture/devices.svelte.ts';
 	import { matchAudioDevice, pickVideoDevice } from '#lib/capture/match.ts';
-	import { AUTO_MODE_ID, findMode, modeLabel, supportedModes } from '#lib/capture/modes.ts';
+	import {
+		AUTO,
+		PREFERRED,
+		modeLabel,
+		supportedFrameRates,
+		supportedResolutions,
+		toMode
+	} from '#lib/capture/modes.ts';
 	import { CaptureSession } from '#lib/capture/session.svelte.ts';
 	import ControlBar from '#lib/components/ControlBar.svelte';
 	import EmptyState, { type Phase } from '#lib/components/EmptyState.svelte';
@@ -78,9 +85,20 @@
 		}))
 	]);
 
-	const modeOptions = $derived<SelectOption[]>([
-		{ value: AUTO_MODE_ID, label: 'Auto (prefer 1080p · 60 fps)' },
-		...supportedModes(session.capabilities).map((m) => ({ value: m.id, label: modeLabel(m) }))
+	const resolutionOptions = $derived<SelectOption[]>([
+		{ value: AUTO, label: `Auto (prefer ${PREFERRED.height}p)` },
+		...supportedResolutions(session.capabilities).map((r) => ({
+			value: String(r.height),
+			label: `${r.height}p (${r.width}×${r.height})`
+		}))
+	]);
+
+	const frameRateOptions = $derived<SelectOption[]>([
+		{ value: AUTO, label: `Auto (prefer ${PREFERRED.frameRate} fps)` },
+		...supportedFrameRates(session.capabilities).map((f) => ({
+			value: String(f),
+			label: `${f} fps`
+		}))
 	]);
 
 	const videoInfo = $derived.by(() => {
@@ -193,7 +211,7 @@
 			return;
 		}
 
-		const mode = findMode(settings.modeId);
+		const mode = toMode(settings.resolution, settings.frameRate);
 		const audioId = resolveAudio(videoId);
 		const result = await session.start({ videoId, audioId, mode });
 		if (!result.ok) return;
@@ -240,15 +258,18 @@
 		if (session.status !== 'idle') void connect();
 	}
 
-	async function selectMode(id: string) {
-		const previous = settings.modeId;
-		settings.modeId = id;
+	const parseChoice = (value: string) => (value === AUTO ? null : Number(value));
+
+	async function changeMode(next: { resolution?: number | null; frameRate?: number | null }) {
+		const previous = { resolution: settings.resolution, frameRate: settings.frameRate };
+		Object.assign(settings, next);
 		if (!live) return;
+		const mode = toMode(settings.resolution, settings.frameRate);
 		try {
-			await session.applyMode(findMode(id));
+			await session.applyMode(mode);
 		} catch {
-			settings.modeId = previous;
-			toasts.show(`${modeLabel(findMode(id))} isn’t supported by this device`, 'error');
+			Object.assign(settings, previous);
+			toasts.show(`${modeLabel(mode)} isn’t supported by this device`, 'error');
 		}
 	}
 
@@ -403,12 +424,14 @@
 		bind:open={panelOpen}
 		{videoOptions}
 		{audioOptions}
-		{modeOptions}
+		{resolutionOptions}
+		{frameRateOptions}
 		videoValue={session.video?.deviceId ??
 			pickVideoDevice(devices.videoInputs, settings.videoId) ??
 			''}
 		audioValue={settings.audioId ?? 'auto'}
-		modeValue={settings.modeId}
+		resolutionValue={settings.resolution === null ? AUTO : String(settings.resolution)}
+		frameRateValue={settings.frameRate === null ? AUTO : String(settings.frameRate)}
 		modeLocked={recording}
 		{videoInfo}
 		{audioInfo}
@@ -416,7 +439,8 @@
 		canSaveToFile={canSaveToFile()}
 		onvideo={selectVideo}
 		onaudio={selectAudio}
-		onmode={selectMode}
+		onresolution={(v) => changeMode({ resolution: parseChoice(v) })}
+		onframerate={(v) => changeMode({ frameRate: parseChoice(v) })}
 	/>
 
 	<Toasts {toasts} />

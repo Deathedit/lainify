@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { audioConstraints, videoConstraints } from './constraints';
-import { findMode } from './modes';
+import { toMode } from './modes';
 
 describe('audioConstraints', () => {
 	it('disables voice processing and asks for stereo 48 kHz', () => {
@@ -26,7 +26,7 @@ describe('videoConstraints', () => {
 	});
 
 	it('requests the exact native mode when strict', () => {
-		const c = videoConstraints(undefined, findMode('720p60'));
+		const c = videoConstraints(undefined, toMode(720, 60));
 		expect(c).not.toHaveProperty('deviceId');
 		expect(c).toMatchObject({
 			width: { exact: 1280 },
@@ -37,11 +37,27 @@ describe('videoConstraints', () => {
 	});
 
 	it('only expresses preferences when relaxed', () => {
-		expect(videoConstraints('cam', findMode('1080p30'), false)).toEqual({
+		expect(videoConstraints('cam', toMode(1080, 30), false)).toEqual({
 			deviceId: { exact: 'cam' },
 			width: { ideal: 1920 },
 			height: { ideal: 1080 },
 			frameRate: { ideal: 30 }
+		});
+	});
+
+	it('pins only the chosen axis and prefers defaults for the other', () => {
+		const c = videoConstraints(undefined, toMode(2160, null));
+		expect(c).toMatchObject({
+			width: { exact: 3840 },
+			height: { exact: 2160 },
+			frameRate: { ideal: 60 },
+			resizeMode: 'none'
+		});
+		expect(videoConstraints(undefined, toMode(null, 30))).toMatchObject({
+			width: { ideal: 1920 },
+			height: { ideal: 1080 },
+			frameRate: { min: 28.5, ideal: 30 },
+			resizeMode: 'none'
 		});
 	});
 });

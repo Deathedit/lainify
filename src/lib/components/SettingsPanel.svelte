@@ -11,10 +11,12 @@
 		open: boolean;
 		videoOptions: SelectOption[];
 		audioOptions: SelectOption[];
-		modeOptions: SelectOption[];
+		resolutionOptions: SelectOption[];
+		frameRateOptions: SelectOption[];
 		videoValue: string;
 		audioValue: string;
-		modeValue: string;
+		resolutionValue: string;
+		frameRateValue: string;
 		/** Mode changes are blocked while recording. */
 		modeLocked: boolean;
 		videoInfo: string;
@@ -23,17 +25,20 @@
 		canSaveToFile: boolean;
 		onvideo: (id: string) => void;
 		onaudio: (id: string) => void;
-		onmode: (id: string) => void;
+		onresolution: (value: string) => void;
+		onframerate: (value: string) => void;
 	}
 
 	let {
 		open = $bindable(),
 		videoOptions,
 		audioOptions,
-		modeOptions,
+		resolutionOptions,
+		frameRateOptions,
 		videoValue,
 		audioValue,
-		modeValue,
+		resolutionValue,
+		frameRateValue,
 		modeLocked,
 		videoInfo,
 		audioInfo,
@@ -41,7 +46,8 @@
 		canSaveToFile,
 		onvideo,
 		onaudio,
-		onmode
+		onresolution,
+		onframerate
 	}: Props = $props();
 
 	const duration = $derived(prefersReducedMotion.current ? 0 : 220);
@@ -114,11 +120,18 @@
 					onchange={onvideo}
 				/>
 				<Select
-					label="Resolution & frame rate"
-					value={modeValue}
-					options={modeOptions}
+					label="Resolution"
+					value={resolutionValue}
+					options={resolutionOptions}
 					disabled={modeLocked}
-					onchange={onmode}
+					onchange={onresolution}
+				/>
+				<Select
+					label="Frame rate"
+					value={frameRateValue}
+					options={frameRateOptions}
+					disabled={modeLocked}
+					onchange={onframerate}
 				/>
 				{@render info(videoInfo)}
 			</section>

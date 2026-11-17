@@ -58,7 +58,7 @@ New GHCR packages start private. To make it public, go to the repo → Packages 
 
 - Picks the capture device automatically and matches its audio input (by USB id, group or name). It never falls back to a microphone.
 - Audio is raw: echo cancellation, noise suppression and AGC are off. It requests stereo at 48 kHz and plays through Web Audio with 0–150 % volume and a stereo peak meter.
-- Resolution / FPS picker limited to the device's reported range. It requests native modes without browser scaling.
+- Separate resolution and frame-rate pickers, each limited to the device's reported range. It requests native modes without browser scaling.
 - Measured presentation fps is shown in the status pill.
 - PNG screenshots at native resolution.
 - Recording to MP4 (H.264/AAC) or WebM. In Chromium you can stream long recordings straight to a file.
